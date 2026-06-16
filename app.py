@@ -16,11 +16,18 @@ import pandas as pd
 import numpy as np
 
 # ==========================================
-# 공통 요청 헤더 및 세션 초기화
+# 공통 요청 헤더 및 세션 초기화 (봇 차단 우회 강화)
 # ==========================================
+# 단순 User-Agent뿐만 아니라 실제 브라우저가 보내는 정보들을 추가하여 봇 탐지 우회
 NAVER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Connection': 'keep-alive',
     'Referer': 'https://finance.naver.com/',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
 }
 
 if "chat_history" not in st.session_state:
@@ -37,6 +44,7 @@ def get_korean_stock_codes():
     url = 'http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13'
     try:
         res = requests.get(url, headers=NAVER_HEADERS, timeout=10)
+        res.raise_for_status() # 에러 발생 시 예외 처리로 넘김
         res.encoding = 'cp949'
         df = pd.read_html(res.text, header=0)[0]
         df['종목코드'] = df['종목코드'].astype(str).str.zfill(6)
@@ -54,7 +62,8 @@ def get_korean_stock_codes():
             else {name: '유가증권시장' for name in df['회사명']}
         )
         return code_dict, market_dict
-    except:
+    except Exception as e:
+        print(f"KRX 종목코드 수집 에러: {e}")
         return {}, {}
 
 def get_ticker_from_name(name, stock_codes, market_dict, us_stocks):
@@ -80,23 +89,30 @@ def get_ticker_from_name(name, stock_codes, market_dict, us_stocks):
 
 @st.cache_data(ttl=60)
 def get_naver_list(url, price_idx, rate_idx):
-    res = requests.get(url, headers=NAVER_HEADERS)
-    res.encoding = 'euc-kr'
-    soup = BeautifulSoup(res.text, 'html.parser')
-    data = []
-    for a_tag in soup.find_all('a', {'class': 'tltle'}):
-        row = a_tag.find_parent('tr')
-        if row:
-            cols = row.find_all('td')
-            if len(cols) > max(price_idx, rate_idx):
-                name  = a_tag.text.strip()
-                price = cols[price_idx].text.strip()
-                rate  = cols[rate_idx].text.strip()
-                if name and price:
-                    data.append({"종목명": name, "현재가": price, "등락률": rate})
-                    if len(data) == 30:
-                        break
-    return pd.DataFrame(data)
+    try:
+        res = requests.get(url, headers=NAVER_HEADERS, timeout=5)
+        res.raise_for_status() # 403 Forbidden 등의 에러를 잡아냄
+        res.encoding = 'euc-kr'
+        # html.parser 대신 더 빠르고 안정적인 lxml 사용
+        soup = BeautifulSoup(res.text, 'lxml') 
+        data = []
+        for a_tag in soup.find_all('a', {'class': 'tltle'}):
+            row = a_tag.find_parent('tr')
+            if row:
+                cols = row.find_all('td')
+                if len(cols) > max(price_idx, rate_idx):
+                    name  = a_tag.text.strip()
+                    price = cols[price_idx].text.strip()
+                    rate  = cols[rate_idx].text.strip()
+                    if name and price:
+                        data.append({"종목명": name, "현재가": price, "등락률": rate})
+                        if len(data) == 30:
+                            break
+        return pd.DataFrame(data)
+    except Exception as e:
+        # 실패 시 빈 데이터프레임을 반환하여 앱이 터지는 것을 방지
+        print(f"네이버 금융 크롤링 실패 ({url}): {e}")
+        return pd.DataFrame()
 
 def load_market_data():
     return {
@@ -112,9 +128,10 @@ def load_market_data():
 def get_major_indices():
     res = {}
     try:
-        r = requests.get("https://finance.naver.com/", headers=NAVER_HEADERS)
+        r = requests.get("https://finance.naver.com/", headers=NAVER_HEADERS, timeout=5)
+        r.raise_for_status()
         r.encoding = 'euc-kr'
-        soup = BeautifulSoup(r.text, 'html.parser')
+        soup = BeautifulSoup(r.text, 'lxml')
 
         for name, css_class in [("KOSPI", ".kospi_area"), ("KOSDAQ", ".kosdaq_area")]:
             box = soup.select_one(css_class)
@@ -143,7 +160,8 @@ def get_major_indices():
                 except: pct = 0.0
 
                 res[name] = {"price": price, "diff": diff, "pct": pct}
-    except:
+    except Exception as e:
+        print(f"주요 지수 크롤링 실패: {e}")
         res["KOSPI"] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
         res["KOSDAQ"] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
 
@@ -295,13 +313,15 @@ def get_fundamentals(ticker, is_us_stock):
         try:
             raw_code = ticker.split('.')[0]
             url = f"https://finance.naver.com/item/main.naver?code={raw_code}"
-            res = requests.get(url, headers=NAVER_HEADERS, timeout=3)
-            soup = BeautifulSoup(res.text, 'html.parser')
+            res = requests.get(url, headers=NAVER_HEADERS, timeout=5)
+            res.raise_for_status()
+            soup = BeautifulSoup(res.text, 'lxml')
             per_tag = soup.select_one('#_per')
             pbr_tag = soup.select_one('#_pbr')
             if per_tag and per_tag.text.strip(): per = per_tag.text.strip() + "배"
             if pbr_tag and pbr_tag.text.strip(): pbr = pbr_tag.text.strip() + "배"
-        except: pass
+        except Exception as e: 
+            print(f"펀더멘털 데이터 크롤링 에러 ({ticker}): {e}")
     return per, pbr
 
 @st.cache_data(ttl=3600)
@@ -476,25 +496,30 @@ tab_main, tab_search, tab_recommend, tab_backtest, tab_chat = st.tabs([
 # ---------------------------------------------------------
 with tab_main:
     m_data = load_market_data()
-    t1, t2, t3, t4, t5, t6 = st.tabs(["👑 KOSPI 시총상위", "👑 KOSDAQ 시총상위", "🔥 검색량 상위", "🌊 거래량 상위", "🚀 상승률 상위", "📉 하락률 상위"])
-    events = {}
-    with t1: events['kospi_cap']  = st.dataframe(m_data['kospi_cap'],  use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t1")
-    with t2: events['kosdaq_cap'] = st.dataframe(m_data['kosdaq_cap'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t2")
-    with t3: events['search_top'] = st.dataframe(m_data['search_top'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t3")
-    with t4: events['volume_top'] = st.dataframe(m_data['volume_top'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t4")
-    with t5: events['price_up']   = st.dataframe(m_data['price_up'],   use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t5")
-    with t6: events['price_down'] = st.dataframe(m_data['price_down'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t6")
 
-    selected_stock = None
-    for category_key, event in events.items():
-        if len(event.selection.rows) > 0:
-            selected_stock = m_data[category_key].iloc[event.selection.rows[0]]['종목명']
-            break
+    # 만약 데이터가 모두 비어있다면, 클라우드 IP 차단 에러 메시지 출력
+    if all(df.empty for df in m_data.values()):
+        st.error("🚨 네이버 금융 등에서 클라우드 서버 접속을 차단(403 Error)하여 실시간 데이터를 불러올 수 없습니다. 웹 브라우저가 아닌 서버에서의 잦은 요청으로 봇 탐지에 걸린 상태입니다.")
+    else:
+        t1, t2, t3, t4, t5, t6 = st.tabs(["👑 KOSPI 시총상위", "👑 KOSDAQ 시총상위", "🔥 검색량 상위", "🌊 거래량 상위", "🚀 상승률 상위", "📉 하락률 상위"])
+        events = {}
+        with t1: events['kospi_cap']  = st.dataframe(m_data['kospi_cap'],  use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t1")
+        with t2: events['kosdaq_cap'] = st.dataframe(m_data['kosdaq_cap'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t2")
+        with t3: events['search_top'] = st.dataframe(m_data['search_top'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t3")
+        with t4: events['volume_top'] = st.dataframe(m_data['volume_top'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t4")
+        with t5: events['price_up']   = st.dataframe(m_data['price_up'],   use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t5")
+        with t6: events['price_down'] = st.dataframe(m_data['price_down'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t6")
 
-    if selected_stock:
-        st.divider()
-        st.markdown(f"### ⚡ **{selected_stock}** 실시간 퀵 스캔")
-        run_quick_analysis(selected_stock, api_key, model_choice, stock_codes, market_dict, us_stocks)
+        selected_stock = None
+        for category_key, event in events.items():
+            if len(event.selection.rows) > 0:
+                selected_stock = m_data[category_key].iloc[event.selection.rows[0]]['종목명']
+                break
+
+        if selected_stock:
+            st.divider()
+            st.markdown(f"### ⚡ **{selected_stock}** 실시간 퀵 스캔")
+            run_quick_analysis(selected_stock, api_key, model_choice, stock_codes, market_dict, us_stocks)
 
 # ---------------------------------------------------------
 # [탭 2] 딥다이브 & Peer 비교 분석
@@ -603,7 +628,7 @@ with tab_recommend:
                 currency = "₩"
 
             if not trending_data:
-                st.error("❌ 시장 데이터를 수집하지 못했습니다.")
+                st.error("❌ 데이터 수집에 실패했습니다. 스트림릿 서버 IP가 네이버 금융 등에서 차단되었을 수 있습니다.")
             else:
                 instruction = "당신은 시장을 움직이는 기사가 무엇인지 본능적으로 꿰뚫어 보는 탁월한 취재 감각을 지닌 금융 데스크이자 퀀트 매니저입니다. [{\"stock\":\"종목명\",\"current_price\":\"숫자만\",\"sentiment\":\"노이즈를 제거한 진짜 호재 요약\",\"reason\":\"선정 이유\"}] 형식의 JSON 배열로 응답하세요."
                 strategy_prompt = "소외되어 있지만 턴어라운드가 기대되는 저평가 가치주(Hidden Gem) 상위 5개를 발굴하세요." if is_hidden_gem else "모멘텀 속에서 가장 강력한 호재를 품은 유망 종목 상위 5개를 추천하세요."

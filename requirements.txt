@@ -8,3 +8,4 @@ numpy
 FinanceDataReader
 beautifulsoup4
 lxml
+pykrx-openapi

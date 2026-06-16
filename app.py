@@ -224,39 +224,78 @@ def get_dart_corp_code(stock_code):
 
 @st.cache_data(ttl=86400)
 def get_dart_financials(corp_code):
+    """
+    DART에서 EPS, BPS 직접 추출
+    - 주식수 계산 불필요 → Yahoo sharesOutstanding 오류 완전 회피
+    - 금액 단위 불일치 문제 완전 회피 (EPS/BPS는 '원/주' 단위로 고정)
+    """
     try:
         dart_key = st.secrets.get("DART_API_KEY", "")
         if not dart_key or not corp_code:
             return None
+
         for year in [str(datetime.now().year - 1), str(datetime.now().year - 2)]:
             for fs_div in ["CFS", "OFS"]:
                 res = requests.get(
                     "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
-                    params={"crtfc_key": dart_key, "corp_code": corp_code,
-                            "bsns_year": year, "reprt_code": "11011", "fs_div": fs_div},
+                    params={
+                        "crtfc_key":  dart_key,
+                        "corp_code":  corp_code,
+                        "bsns_year":  year,
+                        "reprt_code": "11011",  # 사업보고서
+                        "fs_div":     fs_div,
+                    },
                     timeout=10
                 )
                 data = res.json()
                 if data.get("status") != "000":
                     continue
+
                 result = {}
                 for item in data.get("list", []):
-                    acnt = item.get("account_nm", "")
-                    amt  = float(str(item.get("thstrm_amount", "0") or "0").replace(",", "") or "0")
-                    if "당기순이익" in acnt and "지배" not in acnt and "net_income" not in result:
-                        result["net_income"] = amt
-                    if "자본총계" in acnt and "지배" not in acnt and "total_equity" not in result:
-                        result["total_equity"] = amt
+                    acnt = item.get("account_nm", "").strip()
+                    raw  = str(item.get("thstrm_amount", "") or "").replace(",", "").replace(" ", "")
+                    if not raw:
+                        continue
+                    try:
+                        val = float(raw)
+                    except:
+                        continue
+
+                    # 🔥 EPS: 주당순이익 (원/주 단위 - 단위 오해 없음)
+                    if "eps" not in result and any(k in acnt for k in [
+                        "기본주당이익", "기본주당순이익", "주당순이익", "기본주당손익",
+                        "주당이익", "EPS"
+                    ]):
+                        result["eps"] = val
+
+                    # 🔥 BPS: 주당순자산 (원/주 단위 - 단위 오해 없음)
+                    if "bps" not in result and any(k in acnt for k in [
+                        "주당순자산", "1주당순자산", "주당장부가치", "BPS",
+                        "주당자산가치", "1주당 순자산가치"
+                    ]):
+                        result["bps"] = val
+
                 if result:
                     return result
+
     except:
         pass
     return None
 
+
 @st.cache_data(ttl=3600)
 def get_fundamentals(ticker, is_us_stock, df_krx=None):
+    """
+    PER/PBR 계산 우선순위:
+    1. DART EPS/BPS 직접 사용 (가장 정확, 네이버와 동일 원천)
+       PER = 현재가 ÷ EPS
+       PBR = 현재가 ÷ BPS
+    2. Daum Finance API 폴백
+    """
     per, pbr = "N/A", "N/A"
 
+    # ── 미국 주식 ──
     if is_us_stock:
         try:
             info = yf.Ticker(ticker).info
@@ -268,36 +307,42 @@ def get_fundamentals(ticker, is_us_stock, df_krx=None):
 
     raw_code = ticker.split(".")[0]
 
-    # ── DART 직접 계산 (네이버와 동일 원천) ──
+    # ── 플랜 A: DART EPS/BPS 직접 사용 ──
     dart_key = st.secrets.get("DART_API_KEY", "")
     if dart_key:
         try:
             corp_code  = get_dart_corp_code(raw_code)
             financials = get_dart_financials(corp_code) if corp_code else None
+
             if financials:
-                hist   = yf.Ticker(ticker).history(period="1d", auto_adjust=False)
-                price  = float(hist["Close"].iloc[-1]) if not hist.empty else 0
-                info   = yf.Ticker(ticker).fast_info
-                shares = getattr(info, "shares", None)
-                if not shares:
-                    shares = yf.Ticker(ticker).info.get("sharesOutstanding")
-                if price > 0 and shares and shares > 0:
-                    mktcap = price * shares
-                    ni = financials.get("net_income", 0)
-                    eq = financials.get("total_equity", 0)
-                    if ni and ni > 0: per = f"{mktcap / ni:.2f}배"
-                    if eq and eq > 0: pbr = f"{mktcap / eq:.2f}배"
+                hist  = yf.Ticker(ticker).history(period="1d", auto_adjust=False)
+                price = float(hist["Close"].iloc[-1]) if not hist.empty else 0
+
+                if price > 0:
+                    eps = financials.get("eps")
+                    bps = financials.get("bps")
+
+                    # PER = 현재가 ÷ EPS
+                    if eps and eps > 0:
+                        per = f"{price / eps:.2f}배"
+
+                    # PBR = 현재가 ÷ BPS
+                    if bps and bps > 0:
+                        pbr = f"{price / bps:.2f}배"
+
         except:
             pass
 
-    # ── 폴백: Daum Finance API ──
+    # ── 플랜 B: Daum Finance API 폴백 ──
     if per == "N/A" or pbr == "N/A":
         try:
             res = requests.get(
                 f"https://finance.daum.net/api/quotes/A{raw_code}",
-                headers={"User-Agent": "Mozilla/5.0",
-                         "Referer": f"https://finance.daum.net/quotes/A{raw_code}",
-                         "Accept": "application/json"},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer":    f"https://finance.daum.net/quotes/A{raw_code}",
+                    "Accept":     "application/json",
+                },
                 timeout=5
             )
             if res.status_code == 200:
@@ -310,6 +355,7 @@ def get_fundamentals(ticker, is_us_stock, df_krx=None):
             pass
 
     return per, pbr
+
 
 # ==========================================
 # 3. 유틸리티 함수

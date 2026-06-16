@@ -13,6 +13,14 @@ import time
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
+import ta
+
+# DART API 라이브러리
+try:
+    import OpenDartReader
+    DART_AVAILABLE = True
+except ImportError:
+    DART_AVAILABLE = False
 
 # ==========================================
 # 세션 초기화
@@ -158,8 +166,9 @@ def get_kis_volume_rank(market="J"):
 def search_naver_stock(name):
     """네이버 자동완성 - df_krx에 없는 종목도 검색 가능"""
     try:
+        # 🔥 수정됨: URL을 finance.naver.com으로 변경
         res = requests.get(
-            "https://ac.stock.naver.com/ac",
+            "https://ac.finance.naver.com/ac",
             params={"q": name, "target": "stock,index,fund,futures,option"},
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=5
@@ -336,7 +345,6 @@ def get_ticker_from_name(name, df_krx=None):
     if re.match(r'^[A-Za-z]+$', name):
         return name.upper(), True, name.upper()
 
-    # 1순위: df_krx 내 검색
     if df_krx is not None and not df_krx.empty and "Name" in df_krx.columns:
         clean   = name.replace(" ", "").upper()
         exact   = df_krx[df_krx["Name"].str.replace(" ", "").str.upper() == clean]
@@ -348,12 +356,10 @@ def get_ticker_from_name(name, df_krx=None):
             row = partial.iloc[0]
             return row["Ticker"], False, row["Name"]
 
-    # 2순위: 네이버 자동완성
     ticker, found_name = search_naver_stock(name)
     if ticker:
         return ticker, False, found_name
 
-    # 3순위: Yahoo Finance
     try:
         res = requests.get(
             "https://query1.finance.yahoo.com/v1/finance/search",
@@ -433,8 +439,26 @@ def get_stock_history(ticker, is_us, period_days=180):
     return pd.DataFrame()
 
 # ==========================================
-# 5. PER/PBR - KIS 직접 사용
+# 5. DART 재무 데이터 및 펀더멘털
 # ==========================================
+
+@st.cache_data(ttl=3600)
+def get_dart_data(company_name):
+    """🔥 추가됨: DART API를 활용한 기본 재무정보 조회"""
+    if not DART_AVAILABLE:
+        return "OpenDartReader 미설치"
+    try:
+        dart_key = st.secrets.get("DART_API_KEY", "")
+        if not dart_key:
+            return "DART API 키 미설정"
+        dart = OpenDartReader(dart_key)
+        corp = dart.company(company_name)
+        if corp.empty:
+            return "DART 기업 정보 없음"
+        # 간단히 기업 기본 정보 반환 (API 한도 및 속도 고려)
+        return f"[DART 기업개요] 대표자: {corp['ceo_nm']}, 설립일: {corp['est_dt']}, 주요사업: {corp.get('induty_code', 'N/A')}"
+    except Exception as e:
+        return f"DART 데이터 조회 실패 ({e})"
 
 @st.cache_data(ttl=60)
 def get_fundamentals(ticker, is_us_stock, df_krx=None):
@@ -488,7 +512,6 @@ def get_fundamentals(ticker, is_us_stock, df_krx=None):
 
 @st.cache_data(ttl=3600)
 def get_factor_data(code):
-    """KIS API 2번 호출로 4개 팩터 계산 - 순수 데이터 함수 (UI 없음)"""
     token = get_kis_token()
     if not token:
         return None
@@ -515,7 +538,6 @@ def get_factor_data(code):
         result["pbr"]   = sf(d.get("pbr"))
         result["eps"]   = sf(d.get("eps"))
         result["bps"]   = sf(d.get("bps"))
-        # KIS 종목명은 보조용으로만 저장 (나중에 네이버로 덮어씀)
         result["name"]  = d.get("hts_kor_isnm", "")
 
         if result["eps"] and result["bps"] and result["bps"] > 0:
@@ -570,9 +592,7 @@ def get_factor_data(code):
 
     return result
 
-
 def score_factors(factor_rows):
-    """팩터 점수화 - 순수 계산 함수 (UI 없음, 캐시 없음)"""
     if len(factor_rows) < 10:
         return pd.DataFrame()
 
@@ -631,7 +651,7 @@ def score_factors(factor_rows):
     return result.sort_values("종합점수", ascending=False).reset_index(drop=True)
 
 # ==========================================
-# 7. 유틸리티
+# 7. 유틸리티 & 백테스트
 # ==========================================
 
 @st.cache_data(ttl=60)
@@ -698,12 +718,19 @@ def run_backtest(ticker, is_us, start_years=3):
     try:
         df = get_stock_history(ticker, is_us, 365*start_years)
         if df is None or df.empty: return None
+        
         df["MA20"] = df["Close"].rolling(20).mean()
         df["MA60"] = df["Close"].rolling(60).mean()
-        delta = df["Close"].diff()
-        gain  = delta.where(delta>0,0).rolling(14).mean()
-        loss  = (-delta.where(delta<0,0)).rolling(14).mean()
-        df["RSI"] = 100-(100/(1+(gain/loss)))
+        
+        # 🔥 수정됨: ta 라이브러리를 활용한 정확한 RSI 계산 도입
+        if "ta" in sys.modules:
+            df["RSI"] = ta.momentum.RSIIndicator(close=df["Close"], window=14).rsi()
+        else:
+            delta = df["Close"].diff()
+            gain  = delta.where(delta>0,0).rolling(14).mean()
+            loss  = (-delta.where(delta<0,0)).rolling(14).mean()
+            df["RSI"] = 100-(100/(1+(gain/loss)))
+
         df["Signal"] = 0
         df.loc[(df["MA20"]>df["MA60"])&(df["RSI"]<50),"Signal"] = 1
         df.loc[(df["MA20"]<df["MA60"])|(df["RSI"]>70),"Signal"] = -1
@@ -753,10 +780,16 @@ def run_quick_analysis(company_name, api_key, model_choice, df_krx):
             hist["MA60"] = hist["Close"].rolling(60).mean()
             ma20  = hist["MA20"].iloc[-1] if len(hist)>=20 else curr
             ma60  = hist["MA60"].iloc[-1] if len(hist)>=60 else curr
-            delta = hist["Close"].diff()
-            gain  = delta.where(delta>0,0).rolling(14).mean()
-            loss  = (-delta.where(delta<0,0)).rolling(14).mean()
-            rsi   = (100-(100/(1+(gain/loss)))).iloc[-1] if not gain.isna().all() else 50
+            
+            # ta 적용
+            if "ta" in sys.modules:
+                rsi = ta.momentum.RSIIndicator(close=hist["Close"], window=14).rsi().iloc[-1]
+            else:
+                delta = hist["Close"].diff()
+                gain  = delta.where(delta>0,0).rolling(14).mean()
+                loss  = (-delta.where(delta<0,0)).rolling(14).mean()
+                rsi   = (100-(100/(1+(gain/loss)))).iloc[-1] if not gain.isna().all() else 50
+                
             per, pbr  = get_fundamentals(ticker, is_us, df_krx)
             news      = fetch_google_news(display_name, 3)
             news_text = "\n".join([f"- {n}" for n in news]) if news else "최근 뉴스 없음"
@@ -804,8 +837,14 @@ with st.sidebar:
         st.success(f"✅ KIS API ({'실전' if is_real else '모의'}) 실시간 연동")
     else:
         st.error("⚠️ KIS API 연결 실패")
+        
+    try:
+        dart_key = st.secrets["DART_API_KEY"]
+        if DART_AVAILABLE: st.success("✅ DART API 연동")
+    except:
+        st.warning("⚠️ DART_API_KEY 설정 없음 (선택)")
 
-    # 🔥 실제 최신 Gemini 모델명
+    # 🔥 요청하신 모델명 반영
     model_choice = st.selectbox("AI 모델", ("gemini-3.5-flash", "gemini-3.1-pro"))
 
     st.divider()
@@ -875,7 +914,7 @@ with tab_main:
             st.markdown(f"### ⚡ **{selected_stock}** 실시간 퀵 스캔")
             run_quick_analysis(selected_stock, api_key, model_choice, df_krx)
 
-# ── 탭2: 딥다이브 분석 ──
+# ── 탭2: 딥다이브 분석 (DART 연동 추가) ──
 with tab_search:
     st.header("기관 투자자용 심층 종목 분석")
     company_name = st.text_input("검색할 종목명 또는 티커", value="삼성전자")
@@ -894,6 +933,10 @@ with tab_search:
                         macro     = get_macro_data()
                         news_list = fetch_google_news(display_name, 5)
                         news_text = "\n".join([f"- {n}" for n in news_list]) if news_list else "없음"
+                        
+                        # 🔥 DART 정보 수집 (국내 주식 한정)
+                        dart_info = get_dart_data(display_name) if not is_us else "미국 주식은 DART 조회 제외"
+                        
                         peers     = get_peer_group(display_name)
                         peer_data = []
                         for p in peers:
@@ -904,7 +947,7 @@ with tab_search:
                         sym       = "$" if is_us else "₩"
                         price_fmt = f"{sym}{curr:,.2f}" if is_us else f"{sym}{int(curr):,}"
                         report_text, _ = get_ai_response(
-                            f"**[타깃]** {display_name} (현재가:{price_fmt}, PER:{per}, PBR:{pbr})\n**[Peer]** {json.dumps(peer_data,ensure_ascii=False)}\n**[매크로]** 환율:{macro.get('USD_KRW')}, 미10년물:{macro.get('US_10Y')}%, VIX:{macro.get('VIX')}\n**[뉴스]** {news_text}\n\n1.비즈니스모델 2.밸류에이션 3.투자의견 및 목표가를 마크다운으로 작성하라.",
+                            f"**[타깃]** {display_name} (현재가:{price_fmt}, PER:{per}, PBR:{pbr})\n**[DART정보]** {dart_info}\n**[Peer]** {json.dumps(peer_data,ensure_ascii=False)}\n**[매크로]** 환율:{macro.get('USD_KRW')}, 미10년물:{macro.get('US_10Y')}%, VIX:{macro.get('VIX')}\n**[뉴스]** {news_text}\n\n1.비즈니스모델 2.밸류에이션 3.투자의견 및 목표가를 마크다운으로 작성하라.",
                             api_key, model_choice,
                             "당신은 월스트리트 수석 애널리스트입니다. 마크다운으로 작성하세요.",
                             is_json=False
@@ -968,7 +1011,6 @@ with tab_recommend:
                 )
                 data = get_factor_data(code)
                 if data and data.get("price") and data["price"] > 0:
-                    # 🔥 네이버 pool 종목명 항상 우선 적용
                     naver_row = pool[pool["Code"] == code]
                     if not naver_row.empty:
                         data["name"] = naver_row.iloc[0]["Name"]
@@ -977,7 +1019,9 @@ with tab_recommend:
                         if found_name:
                             data["name"] = found_name
                     factor_rows.append(data)
-                time.sleep(0.05)
+                
+                # 🔥 수정됨: KIS API Rate Limit(초당 20건 제한) 방어를 위해 0.1초로 연장
+                time.sleep(0.1)
 
             progress.empty()
 

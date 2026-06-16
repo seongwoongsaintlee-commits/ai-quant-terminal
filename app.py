@@ -1,3 +1,4 @@
+%%writefile app.py
 import streamlit as st
 import re
 
@@ -14,11 +15,11 @@ from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
+import FinanceDataReader as fdr # 추가된 안정적인 금융 라이브러리
 
 # ==========================================
-# 공통 요청 헤더 및 세션 초기화 (봇 차단 우회 강화)
+# 공통 요청 헤더 및 세션 초기화
 # ==========================================
-# 단순 User-Agent뿐만 아니라 실제 브라우저가 보내는 정보들을 추가하여 봇 탐지 우회
 NAVER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -39,38 +40,23 @@ if "current_stock" not in st.session_state:
 # 1. 크롤링 및 유틸리티 함수
 # ==========================================
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400) # 종목 코드는 하루 한 번만 가져와도 충분합니다
 def get_korean_stock_codes():
-    url = 'http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13'
     try:
-        res = requests.get(url, headers=NAVER_HEADERS, timeout=10)
-        res.raise_for_status() # 에러 발생 시 예외 처리로 넘김
-        res.encoding = 'cp949'
-        df = pd.read_html(res.text, header=0)[0]
-        df['종목코드'] = df['종목코드'].astype(str).str.zfill(6)
-
-        market_col = None
-        for candidate in ['시장구분', '시장', '상장시장']:
-            if candidate in df.columns:
-                market_col = candidate
-                break
-
-        code_dict = dict(zip(df['회사명'], df['종목코드']))
-        market_dict = (
-            dict(zip(df['회사명'], df[market_col]))
-            if market_col
-            else {name: '유가증권시장' for name in df['회사명']}
-        )
+        # FinanceDataReader를 사용하여 안정적으로 종목코드 수집 (KRX 차단 문제 해결!)
+        df = fdr.StockListing('KRX')
+        code_dict = dict(zip(df['Name'], df['Code']))
+        market_dict = dict(zip(df['Name'], df['Market']))
         return code_dict, market_dict
     except Exception as e:
-        print(f"KRX 종목코드 수집 에러: {e}")
+        print(f"종목코드 수집 에러: {e}")
         return {}, {}
 
 def get_ticker_from_name(name, stock_codes, market_dict, us_stocks):
     name = name.strip()
     if name in us_stocks: return us_stocks[name], True, name
     if re.match(r'^[A-Za-z]+$', name): return name.upper(), True, name.upper()
-
+    
     matched_name = name
     if name not in stock_codes:
         clean_input = name.replace(" ", "").upper()
@@ -78,22 +64,21 @@ def get_ticker_from_name(name, stock_codes, market_dict, us_stocks):
             if clean_input in k.replace(" ", "").upper():
                 matched_name = k
                 break
-
+                
     if matched_name in stock_codes:
         raw_code = stock_codes[matched_name]
         market = str(market_dict.get(matched_name, "유가증권시장")).upper()
         ticker = f"{raw_code}.KQ" if ("KOSDAQ" in market or "코스닥" in market) else f"{raw_code}.KS"
         return ticker, False, matched_name
-
+        
     return None, False, name
 
 @st.cache_data(ttl=60)
 def get_naver_list(url, price_idx, rate_idx):
     try:
         res = requests.get(url, headers=NAVER_HEADERS, timeout=5)
-        res.raise_for_status() # 403 Forbidden 등의 에러를 잡아냄
+        res.raise_for_status() 
         res.encoding = 'euc-kr'
-        # html.parser 대신 더 빠르고 안정적인 lxml 사용
         soup = BeautifulSoup(res.text, 'lxml') 
         data = []
         for a_tag in soup.find_all('a', {'class': 'tltle'}):
@@ -110,7 +95,6 @@ def get_naver_list(url, price_idx, rate_idx):
                             break
         return pd.DataFrame(data)
     except Exception as e:
-        # 실패 시 빈 데이터프레임을 반환하여 앱이 터지는 것을 방지
         print(f"네이버 금융 크롤링 실패 ({url}): {e}")
         return pd.DataFrame()
 
@@ -132,39 +116,38 @@ def get_major_indices():
         r.raise_for_status()
         r.encoding = 'euc-kr'
         soup = BeautifulSoup(r.text, 'lxml')
-
+        
         for name, css_class in [("KOSPI", ".kospi_area"), ("KOSDAQ", ".kosdaq_area")]:
             box = soup.select_one(css_class)
             if box:
                 num_tag = box.select_one('.num')
                 num2_tag = box.select_one('.num2')
                 num3_tag = box.select_one('.num3')
-
+                
                 price = float(num_tag.text.strip().replace(',', '')) if num_tag else 0.0
                 diff = float(num2_tag.text.strip().replace(',', '')) if num2_tag else 0.0
                 pct_text = num3_tag.text.strip().replace('%', '') if num3_tag else "0"
-
+                
                 state_tag = box.select_one('.blind')
                 is_down = False
                 if state_tag and "하락" in state_tag.text:
                     is_down = True
                 if num2_tag and "txt_down" in "".join(num2_tag.get('class', [])):
                     is_down = True
-
+                    
                 if is_down:
                     diff = -abs(diff)
                     if not pct_text.startswith("-"):
                         pct_text = "-" + pct_text
-
+                
                 try: pct = float(pct_text.replace('+', ''))
                 except: pct = 0.0
-
+                
                 res[name] = {"price": price, "diff": diff, "pct": pct}
     except Exception as e:
-        print(f"주요 지수 크롤링 실패: {e}")
         res["KOSPI"] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
         res["KOSDAQ"] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
-
+        
     us_indices = {"NASDAQ": "^IXIC", "S&P 500": "^GSPC"}
     for name, ticker in us_indices.items():
         try:
@@ -175,7 +158,7 @@ def get_major_indices():
                 res[name] = {"price": curr, "diff": curr - prev, "pct": ((curr - prev) / prev) * 100}
         except:
             res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
-
+            
     return res
 
 @st.cache_data(ttl=3600)
@@ -203,18 +186,18 @@ def get_trending_stocks_with_news(stock_codes_dict, market_dict):
     m_data = load_market_data()
     search_top = m_data.get('search_top', pd.DataFrame())
     volume_top = m_data.get('volume_top', pd.DataFrame())
-
+    
     if search_top.empty and volume_top.empty: return []
     pool = pd.concat([search_top, volume_top]).drop_duplicates(subset=['종목명']).head(15)
     candidates = []
-
+    
     for _, row in pool.iterrows():
         name = row['종목명']
         raw_code = stock_codes_dict.get(name)
         if not raw_code: continue
         market = str(market_dict.get(name, "유가증권시장")).upper()
         ticker = f"{raw_code}.KQ" if ("KOSDAQ" in market or "코스닥" in market) else f"{raw_code}.KS"
-
+        
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             if not hist.empty:
@@ -246,14 +229,14 @@ def get_hidden_gem_stocks(stock_codes_dict, market_dict):
         noisy_stocks.update(m_data['search_top']['종목명'].tolist())
     if not m_data.get('volume_top', pd.DataFrame()).empty:
         noisy_stocks.update(m_data['volume_top']['종목명'].tolist())
-
+        
     kospi_cap = m_data.get('kospi_cap', pd.DataFrame())
     kosdaq_cap = m_data.get('kosdaq_cap', pd.DataFrame())
     pool = pd.concat([kospi_cap, kosdaq_cap]).drop_duplicates(subset=['종목명'])
-
+    
     quiet_pool = pool[~pool['종목명'].isin(noisy_stocks)].head(40)
     sampled_pool = quiet_pool.sample(n=min(15, len(quiet_pool))) if not quiet_pool.empty else quiet_pool
-
+    
     candidates = []
     for _, row in sampled_pool.iterrows():
         name = row['종목명']
@@ -261,7 +244,7 @@ def get_hidden_gem_stocks(stock_codes_dict, market_dict):
         if not raw_code: continue
         market = str(market_dict.get(name, "유가증권시장")).upper()
         ticker = f"{raw_code}.KQ" if ("KOSDAQ" in market or "코스닥" in market) else f"{raw_code}.KS"
-
+        
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             if not hist.empty:
@@ -331,26 +314,26 @@ def run_backtest(ticker, start_years=3):
         start_date = end_date - timedelta(days=365 * start_years)
         df = yf.Ticker(ticker).history(start=start_date, end=end_date)
         if df.empty: return None
-
+        
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
-
+        
         delta = df['Close'].diff()
         gain = delta.where(delta > 0, 0).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         df['RSI'] = 100 - (100 / (1 + (gain / loss)))
-
+        
         df['Signal'] = 0
         df.loc[(df['MA20'] > df['MA60']) & (df['RSI'] < 50), 'Signal'] = 1
         df.loc[(df['MA20'] < df['MA60']) | (df['RSI'] > 70), 'Signal'] = -1
-
+        
         df['Position'] = df['Signal'].replace(-1, 0).shift()
         df['Market_Return'] = df['Close'].pct_change()
         df['Strategy_Return'] = df['Position'] * df['Market_Return']
-
+        
         df['Cumulative_Market'] = (1 + df['Market_Return']).cumprod()
         df['Cumulative_Strategy'] = (1 + df['Strategy_Return']).cumprod()
-
+        
         return df
     except:
         return None
@@ -361,7 +344,7 @@ def get_ai_response(prompt_text, api_key, model_choice, instruction_text, is_jso
         genai.configure(api_key=api_key)
         config = {"temperature": 0.2}
         if is_json: config["response_mime_type"] = "application/json"
-
+            
         model = genai.GenerativeModel(
             model_name=model_choice,
             system_instruction=instruction_text,
@@ -370,7 +353,7 @@ def get_ai_response(prompt_text, api_key, model_choice, instruction_text, is_jso
         response = model.generate_content(prompt_text)
         clean_text = response.text.strip()
         called_at = time.strftime("%H:%M:%S")
-
+        
         if is_json:
             ticks = "`" * 3
             if clean_text.startswith(ticks):
@@ -385,7 +368,7 @@ def get_ai_response(prompt_text, api_key, model_choice, instruction_text, is_jso
 def run_quick_analysis(company_name, api_key, model_choice, stock_codes, market_dict, us_stocks):
     ticker, is_us_stock, display_name = get_ticker_from_name(company_name, stock_codes, market_dict, us_stocks)
     if not ticker:
-        st.error("종목을 찾을 수 없습니다.")
+        st.error("종목을 찾을 수 없습니다. (종목코드 맵핑 실패)")
         return
 
     st.session_state.current_stock = display_name
@@ -418,7 +401,7 @@ def run_quick_analysis(company_name, api_key, model_choice, stock_codes, market_
 
             instruction = "당신은 월스트리트 퀀트 애널리스트입니다. JSON 형식({'action':'BUY/SELL/HOLD', 'reason':'직관적인 분석 코멘트'})으로만 응답하세요."
             prompt = f"[{display_name}] 현재가:{price_fmt}, RSI:{current_rsi:.2f}, 20일선:{ma20:.2f}, 60일선:{ma60:.2f}, PER:{per}, PBR:{pbr}, 뉴스:{news_text}. 위 데이터를 바탕으로 트레이딩 관점의 투자 의견과 짧은 이유를 제시하세요."
-
+            
             result, called_at = get_ai_response(prompt, api_key, model_choice, instruction, is_json=True)
             if result is None:
                 return
@@ -433,7 +416,7 @@ def run_quick_analysis(company_name, api_key, model_choice, stock_codes, market_
                 if action == "BUY": st.success(f"### 의견: {action} 🟢")
                 elif action == "SELL": st.error(f"### 의견: {action} 🔴")
                 else: st.warning(f"### 의견: {action} 🟡")
-
+                
                 st.markdown(f"**RSI(14):** `{current_rsi:.2f}` | **PER:** `{per}` | **PBR:** `{pbr}`")
                 st.info(f"**AI 분석 코멘트:**\n{result.get('reason', '')}")
                 st.caption(f"기준 시각: {called_at}")
@@ -449,17 +432,16 @@ us_stocks = {"애플": "AAPL", "엔비디아": "NVDA", "테슬라": "TSLA", "마
 
 with st.sidebar:
     st.header("⚙️ 터미널 설정")
-
-    # 🌟 1. 하드코딩된 API 키를 스트림릿 비밀금고(st.secrets)로 변경!
+    
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
         st.success("✅ 클라우드 보안 키 자동 연동 완료")
     except:
         st.error("⚠️ Secrets 설정이 필요합니다. (또는 테스트용으로 하드코딩 필요)")
-        api_key = "" # 배포 전 로컬에서 테스트할 경우 여기에 임시로 키를 넣고 쓰셔도 됩니다.
-
+        api_key = "" 
+        
     model_choice = st.selectbox("사용할 AI 모델", ("gemini-3.5-flash", "gemini-3.5-pro"))
-
+    
     st.divider()
     st.header("🔗 자동화 워크플로우")
     webhook_url = st.text_input("Webhook URL (Apps Script / Slack)", placeholder="https://script.google.com/macros/s/...")
@@ -496,10 +478,9 @@ tab_main, tab_search, tab_recommend, tab_backtest, tab_chat = st.tabs([
 # ---------------------------------------------------------
 with tab_main:
     m_data = load_market_data()
-
-    # 만약 데이터가 모두 비어있다면, 클라우드 IP 차단 에러 메시지 출력
+    
     if all(df.empty for df in m_data.values()):
-        st.error("🚨 네이버 금융 등에서 클라우드 서버 접속을 차단(403 Error)하여 실시간 데이터를 불러올 수 없습니다. 웹 브라우저가 아닌 서버에서의 잦은 요청으로 봇 탐지에 걸린 상태입니다.")
+        st.error("🚨 네이버 금융 등에서 클라우드 서버 접속을 차단(403 Error)하여 실시간 데이터를 불러올 수 없습니다.")
     else:
         t1, t2, t3, t4, t5, t6 = st.tabs(["👑 KOSPI 시총상위", "👑 KOSDAQ 시총상위", "🔥 검색량 상위", "🌊 거래량 상위", "🚀 상승률 상위", "📉 하락률 상위"])
         events = {}
@@ -526,12 +507,12 @@ with tab_main:
 # ---------------------------------------------------------
 with tab_search:
     st.header("기관 투자자용 심층 종목 분석")
-    company_name = st.text_input("검색할 종목명 또는 티커", value="코스맥스엔비티") 
+    company_name = st.text_input("검색할 종목명 또는 티커", value="삼성전자") 
     analyze_btn  = st.button("심층 펀더멘털 분석 시작")
-
+    
     if analyze_btn and company_name:
         ticker, is_us_stock, display_name = get_ticker_from_name(company_name, stock_codes, market_dict, us_stocks)
-
+        
         if not ticker:
             st.error("종목을 찾을 수 없습니다.")
         else:
@@ -582,10 +563,10 @@ with tab_search:
 *   **1-Minute Pitch:** 핵심 투자 아이디어 3줄 요약
 """
                     report_text, called_at = get_ai_response(prompt, api_key, model_choice, instruction, is_json=False)
-
+                    
                     if report_text:
                         st.success(f"✅ {display_name} 기관 투자자용 심층 리포트 발간 완료")
-
+                        
                         col1, col2 = st.columns([1, 2])
                         with col1:
                             st.subheader("📈 기본 가치 및 피어(Peer) 비교")
@@ -607,7 +588,7 @@ with tab_search:
 with tab_recommend:
     st.header("🏆 듀얼 엔진 주식 스크리너")
     st.write("알맹이 없는 홍보성 기사는 거르고, 실제 실적과 펀더멘털을 움직이는 '진짜 호재'만 골라내는 고도화된 센티먼트 분석을 수행합니다.")
-
+    
     col_a, col_b = st.columns(2)
     with col_a:
         market_choice = st.radio("분석할 시장 선택:", ["🇰🇷 국내 증시", "🇺🇸 미국 증시"], horizontal=True)
@@ -616,10 +597,10 @@ with tab_recommend:
 
     if st.button(f"🚀 실시간 {strategy_choice.split(' ')[1]} 추천받기", use_container_width=True):
         with st.spinner("시장 데이터 스크리닝 및 데스킹(Desking) 필터 가동 중..."):
-
+            
             is_us_recom = "미국" in market_choice
             is_hidden_gem = "숨은 보석" in strategy_choice
-
+            
             if is_us_recom:
                 trending_data = get_us_hidden_gems_with_news() if is_hidden_gem else get_us_trending_stocks_with_news()
                 currency = "$"
@@ -648,7 +629,7 @@ with tab_recommend:
                                     else: fmt_price = f"₩{int(float(raw_price)):,}"
                                 except:
                                     fmt_price = f"{currency}{rec.get('current_price', 0)}"
-
+                                        
                                 st.metric("현재가", fmt_price)
                                 st.markdown(f"**📰 데스크 판독 결과:**\n{rec.get('sentiment')}")
                                 st.write(f"**💡 추천 사유:**\n{rec.get('reason')}")
@@ -661,13 +642,13 @@ with tab_recommend:
 with tab_backtest:
     st.header("⏳ 퀀트 알고리즘 과거 수익률 백테스팅")
     st.write("AI가 추천한 종목이 실제로 기술적 매수/매도 로직(MA Crossover + RSI)에서 과거 3년간 어느 정도의 승률을 기록했는지 시뮬레이션합니다.")
-
+    
     col1, col2 = st.columns([1, 3])
     with col1:
         test_ticker_input = st.text_input("백테스트 종목명 또는 티커", value="AAPL")
         test_years = st.slider("테스트 기간 (년)", min_value=1, max_value=5, value=3)
         run_bt = st.button("백테스트 시뮬레이션 가동")
-
+        
     with col2:
         if run_bt and test_ticker_input:
             t_code, _, t_name = get_ticker_from_name(test_ticker_input, stock_codes, market_dict, us_stocks)
@@ -678,12 +659,12 @@ with tab_backtest:
                     if bt_df is not None and not bt_df.empty:
                         market_return = (bt_df['Cumulative_Market'].iloc[-1] - 1) * 100
                         strat_return = (bt_df['Cumulative_Strategy'].iloc[-1] - 1) * 100
-
+                        
                         st.subheader(f"📊 {t_name} 과거 {test_years}년 시뮬레이션 결과")
                         c1, c2 = st.columns(2)
                         c1.metric("그냥 들고 있었을 때 (Buy & Hold)", f"{market_return:.2f}%")
                         c2.metric("전략 매매 수익률 (알고리즘)", f"{strat_return:.2f}%", delta=f"{strat_return - market_return:.2f}% (초과수익)")
-
+                        
                         st.line_chart(bt_df[['Cumulative_Market', 'Cumulative_Strategy']])
                         st.caption("※ 전략 로직: 20일선이 60일선을 돌파(골든크로스)하고 RSI가 50 이하일 때 매수 / 데드크로스 또는 RSI 70 이상일 때 매도")
                     else:
@@ -696,7 +677,7 @@ with tab_backtest:
 # ---------------------------------------------------------
 with tab_chat:
     st.header(f"💬 전담 AI 애널리스트 실시간 채팅")
-
+    
     current_focus = st.session_state.get('current_stock', '없음')
     if current_focus != "없음":
         st.info(f"💡 AI가 현재 사용자님이 **'{current_focus}'** 종목을 분석하고 있다는 것을 인지하고 있습니다. 관련된 추가 질문을 자유롭게 남겨주세요!")
@@ -728,7 +709,7 @@ with tab_chat:
         with st.spinner("애널리스트가 시장 데이터를 검토하며 답변을 작성 중입니다..."):
             bot_instruction = "당신은 월스트리트 수석 퀀트 애널리스트로서 사용자의 주식 관련 질문에 전문적이고 친절하게 답하는 챗봇입니다."
             response_text, _ = get_ai_response(context_prompt, api_key, model_choice, bot_instruction, is_json=False)
-
+            
             if response_text:
                 with st.chat_message("assistant"):
                     st.markdown(response_text)

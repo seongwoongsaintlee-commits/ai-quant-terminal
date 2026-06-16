@@ -2,9 +2,10 @@ streamlit
 yfinance
 feedparser
 google-generativeai
-beautifulsoup4
+requests
 pandas
 numpy
-requests
+FinanceDataReader
+pykrx
+beautifulsoup4
 lxml
-finance-datareader

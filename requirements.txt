@@ -5,6 +5,5 @@ google-generativeai
 requests
 pandas
 numpy
-FinanceDataReader
 beautifulsoup4
 lxml

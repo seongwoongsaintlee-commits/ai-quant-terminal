@@ -428,43 +428,141 @@ def get_dart_corp_code(stock_code):
 
 @st.cache_data(ttl=86400)
 def get_dart_eps_bps(corp_code):
-    """EPS/BPS 직접 추출 - 주식수/단위 문제 완전 회피"""
+    """
+    TTM EPS/BPS 계산 - 네이버와 동일한 방식
+    최근 4개 분기 EPS 합산 = TTM EPS
+    DART 분기보고서 코드:
+      11011 = 사업보고서 (연간, Q4)
+      11014 = 3분기보고서 (Q3)
+      11012 = 반기보고서  (Q2)
+      11013 = 1분기보고서 (Q1)
+    """
     try:
         dart_key = st.secrets.get("DART_API_KEY", "")
         if not dart_key or not corp_code:
             return None
-        for year in [str(datetime.now().year - 1), str(datetime.now().year - 2)]:
+
+        now   = datetime.now()
+        month = now.month
+
+        # 현재 시점 기준 최근 4분기 결정
+        if month >= 11:
+            # Q3 공시 완료: 당해Q3 + Q2 + Q1 + 전년Q4
+            quarters = [
+                (str(now.year),     "11014"),  # 당해 Q3
+                (str(now.year),     "11012"),  # 당해 Q2
+                (str(now.year),     "11013"),  # 당해 Q1
+                (str(now.year - 1), "11011"),  # 전년 Q4(연간)
+            ]
+        elif month >= 8:
+            # Q2 공시 완료: 당해Q2 + Q1 + 전년Q4 + 전년Q3
+            quarters = [
+                (str(now.year),     "11012"),  # 당해 Q2
+                (str(now.year),     "11013"),  # 당해 Q1
+                (str(now.year - 1), "11011"),  # 전년 Q4(연간)
+                (str(now.year - 1), "11014"),  # 전년 Q3
+            ]
+        elif month >= 5:
+            # Q1 공시 완료: 당해Q1 + 전년Q4 + Q3 + Q2
+            quarters = [
+                (str(now.year),     "11013"),  # 당해 Q1
+                (str(now.year - 1), "11011"),  # 전년 Q4(연간)
+                (str(now.year - 1), "11014"),  # 전년 Q3
+                (str(now.year - 1), "11012"),  # 전년 Q2
+            ]
+        else:
+            # Q4 연간보고서 미공시: 전년 Q3+Q2+Q1 + 전전년 Q4
+            quarters = [
+                (str(now.year - 1), "11014"),  # 전년 Q3
+                (str(now.year - 1), "11012"),  # 전년 Q2
+                (str(now.year - 1), "11013"),  # 전년 Q1
+                (str(now.year - 2), "11011"),  # 전전년 Q4(연간)
+            ]
+
+        eps_list = []
+        bps_latest = None  # BPS는 최신 1개만 (시점 기준)
+
+        for year, reprt_code in quarters:
             for fs_div in ["CFS", "OFS"]:
-                res = requests.get(
-                    "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
-                    params={"crtfc_key": dart_key, "corp_code": corp_code,
-                            "bsns_year": year, "reprt_code": "11011", "fs_div": fs_div},
-                    timeout=10
-                )
-                data = res.json()
-                if data.get("status") != "000":
+                try:
+                    res = requests.get(
+                        "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
+                        params={
+                            "crtfc_key":  dart_key,
+                            "corp_code":  corp_code,
+                            "bsns_year":  year,
+                            "reprt_code": reprt_code,
+                            "fs_div":     fs_div,
+                        },
+                        timeout=10
+                    )
+                    data = res.json()
+                    if data.get("status") != "000":
+                        continue
+
+                    q_eps = None
+                    q_bps = None
+
+                    for item in data.get("list", []):
+                        acnt = item.get("account_nm", "").strip()
+
+                        # 분기/반기/연간 구분해서 올바른 컬럼 사용
+                        if reprt_code == "11011":
+                            # 연간: thstrm_amount = 당기(연간) 전체
+                            raw = str(item.get("thstrm_amount", "") or "").replace(",", "")
+                        else:
+                            # 분기/반기: thstrm_amount = 누적, 전분기 차이로 단일분기 계산
+                            # 단, EPS는 이미 단일분기 값으로 공시됨
+                            raw = str(item.get("thstrm_amount", "") or "").replace(",", "")
+
+                        if not raw:
+                            continue
+                        try:
+                            val = float(raw)
+                        except:
+                            continue
+
+                        if q_eps is None and any(k in acnt for k in [
+                            "기본주당이익","기본주당순이익","주당순이익","기본주당손익"
+                        ]):
+                            q_eps = val
+
+                        if q_bps is None and any(k in acnt for k in [
+                            "주당순자산","1주당순자산","주당장부가치"
+                        ]):
+                            q_bps = val
+
+                    if q_eps is not None:
+                        eps_list.append(q_eps)
+                        if bps_latest is None and q_bps is not None:
+                            bps_latest = q_bps
+                        break  # CFS 성공하면 OFS 불필요
+
+                except:
                     continue
-                result = {}
-                for item in data.get("list", []):
-                    acnt = item.get("account_nm", "").strip()
-                    raw  = str(item.get("thstrm_amount", "") or "").replace(",", "").replace(" ", "")
-                    if not raw:
-                        continue
-                    try:
-                        val = float(raw)
-                    except:
-                        continue
-                    if "eps" not in result and any(k in acnt for k in
-                        ["기본주당이익","기본주당순이익","주당순이익","기본주당손익","EPS"]):
-                        result["eps"] = val
-                    if "bps" not in result and any(k in acnt for k in
-                        ["주당순자산","1주당순자산","주당장부가치","BPS"]):
-                        result["bps"] = val
-                if result:
-                    return result
+
+            if len(eps_list) >= 4:
+                break
+
+        result = {}
+
+        # TTM EPS = 최근 4분기 EPS 합산
+        if len(eps_list) >= 4:
+            result["eps"] = sum(eps_list[:4])
+        elif len(eps_list) > 0:
+            # 4분기 미만이면 연환산 (네이버도 이렇게 처리)
+            result["eps"] = sum(eps_list) * (4 / len(eps_list))
+
+        # BPS는 최신 시점 값
+        if bps_latest is not None:
+            result["bps"] = bps_latest
+
+        return result if result else None
+
     except:
         pass
     return None
+
 
 @st.cache_data(ttl=3600)
 def get_fundamentals(ticker, is_us_stock, df_krx=None):

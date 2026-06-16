@@ -11,19 +11,15 @@ import json
 import requests
 import time
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
 
 # ==========================================
-# 공통 요청 헤더 및 변수 세팅
+# 공통 요청 헤더 (모바일 아이폰으로 완벽 위장)
 # ==========================================
-NAVER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Connection': 'keep-alive',
-    'Referer': 'https://finance.naver.com/',
+MOBILE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+    'Accept': 'application/json, text/plain, */*'
 }
 
 US_STOCKS = {"애플": "AAPL", "엔비디아": "NVDA", "테슬라": "TSLA", "마이크로소프트": "MSFT"}
@@ -34,118 +30,94 @@ if "current_stock" not in st.session_state:
     st.session_state.current_stock = "없음"
 
 # ==========================================
-# 1. 크롤링 및 유틸리티 함수 (KRX 우회 + 한글 인코딩 해결)
+# 1. 크롤링 폐기 -> 모바일 API 및 글로벌 API로 전면 교체
 # ==========================================
 
 @st.cache_data(ttl=86400)
-def get_ticker_from_naver(keyword):
+def get_ticker_from_name(keyword):
     keyword = keyword.strip()
-    if keyword in US_STOCKS: 
-        return US_STOCKS[keyword], True, keyword
-    # 영어로만 이루어진 입력은 미국 티커로 간주
-    if re.match(r'^[A-Za-z]+$', keyword): 
-        return keyword.upper(), True, keyword.upper()
+    if keyword in US_STOCKS: return US_STOCKS[keyword], True, keyword
+    if re.match(r'^[A-Za-z]+$', keyword): return keyword.upper(), True, keyword.upper()
 
+    # 1. 네이버 모바일 검색 API 활용 (차단 우회 및 속도 극대화)
     try:
-        # 🔥 한글 깨짐 방지: 네이버 구형 서버에 맞춰 한글을 EUC-KR로 변환 후 전송
-        encoded_keyword = urllib.parse.quote(keyword.encode('euc-kr'))
-        # r_enc=utf-8 로 설정하여 받는 결과는 파이썬이 읽기 쉬운 최신 포맷으로 받음
-        url = f"https://ac.finance.naver.com/ac?q={encoded_keyword}&q_enc=euc-kr&st=111&r_format=json&r_enc=utf-8"
-        
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-        data = res.json()
-        items = data.get('items', [[]])[0]
-        
+        url = f"https://m.stock.naver.com/api/json/search/searchListJson.nhn?keyword={urllib.parse.quote(keyword)}"
+        res = requests.get(url, headers=MOBILE_HEADERS, timeout=5)
+        items = res.json().get('result', {}).get('items', [])
         if items:
-            for item in items:
-                name, code, market = item[0], item[1], item[2]
-                if keyword.replace(" ", "").upper() in name.replace(" ", "").upper():
-                    ticker = f"{code}.KQ" if "KOSDAQ" in market or "코스닥" in market else f"{code}.KS"
-                    return ticker, False, name
-            
-            # 완벽히 일치하는 이름이 없으면 최상단 첫 번째 검색 결과 반환
-            name, code, market = items[0][0], items[0][1], items[0][2]
-            ticker = f"{code}.KQ" if "KOSDAQ" in market or "코스닥" in market else f"{code}.KS"
+            code = items[0]['code']
+            name = items[0]['name']
+            ticker = f"{code}.KS"
+            # 야후 파이낸스에서 KOSPI(.KS)로 검색해보고 없으면 KOSDAQ(.KQ)으로 반환
+            if yf.Ticker(ticker).history(period="1d").empty:
+                ticker = f"{code}.KQ"
             return ticker, False, name
-    except Exception as e:
-        print(f"네이버 맵핑 오류: {e}")
+    except:
         pass
-    
+
+    # 2. 모바일 API 실패 시 FinanceDataReader 백업 가동
+    try:
+        import FinanceDataReader as fdr
+        df = fdr.StockListing('KRX')
+        match = df[df['Name'].str.contains(keyword, na=False, case=False)]
+        if not match.empty:
+            code = match.iloc[0]['Code']
+            name = match.iloc[0]['Name']
+            market = match.iloc[0]['Market']
+            ticker = f"{code}.KQ" if "KOSDAQ" in market else f"{code}.KS"
+            return ticker, False, name
+    except:
+        pass
+        
     return None, False, keyword
 
 @st.cache_data(ttl=60)
-def get_naver_list(url, price_idx, rate_idx):
+def get_mobile_market_list(api_type, market):
+    # 네이버 모바일 전용 JSON 데이터 직접 호출 (크롤링 불필요)
+    url = f"https://m.stock.naver.com/api/stocks/{api_type}/{market}?page=1&pageSize=15"
     try:
-        res = requests.get(url, headers=NAVER_HEADERS, timeout=5)
-        res.encoding = 'euc-kr'
-        soup = BeautifulSoup(res.text, 'lxml') 
-        data = []
-        for a_tag in soup.find_all('a', {'class': 'tltle'}):
-            row = a_tag.find_parent('tr')
-            if row:
-                cols = row.find_all('td')
-                if len(cols) > max(price_idx, rate_idx):
-                    name  = a_tag.text.strip()
-                    price = cols[price_idx].text.strip()
-                    rate  = cols[rate_idx].text.strip()
-                    if name and price:
-                        data.append({"종목명": name, "현재가": price, "등락률": rate})
-                        if len(data) == 30:
-                            break
-        return pd.DataFrame(data)
+        res = requests.get(url, headers=MOBILE_HEADERS, timeout=5)
+        stocks = res.json().get('stocks', [])
+        result = []
+        for s in stocks:
+            price = str(s.get('closePrice', '0'))
+            ratio = str(s.get('fluctuationsRatio', '0'))
+            if not ratio.startswith('-'): ratio = "+" + ratio
+            result.append({
+                "종목명": s.get('stockName', ''),
+                "현재가": price,
+                "등락률": ratio + "%"
+            })
+        return pd.DataFrame(result)
     except Exception as e:
         return pd.DataFrame()
 
 def load_market_data():
     return {
-        "kospi_cap":  get_naver_list("https://finance.naver.com/sise/sise_market_sum.naver?sosok=0", 2, 4),
-        "kosdaq_cap": get_naver_list("https://finance.naver.com/sise/sise_market_sum.naver?sosok=1", 2, 4),
-        "search_top": get_naver_list("https://finance.naver.com/sise/lastsearch2.naver", 3, 5),
-        "volume_top": get_naver_list("https://finance.naver.com/sise/sise_quant.naver", 2, 4),
-        "price_up":   get_naver_list("https://finance.naver.com/sise/sise_rise.naver", 2, 4),
-        "price_down": get_naver_list("https://finance.naver.com/sise/sise_fall.naver", 2, 4),
+        "kospi_cap":  get_mobile_market_list("marketValue", "KOSPI"),
+        "kosdaq_cap": get_mobile_market_list("marketValue", "KOSDAQ"),
+        "kospi_vol":  get_mobile_market_list("quant", "KOSPI"),
+        "kosdaq_vol": get_mobile_market_list("quant", "KOSDAQ"),
+        "price_up":   get_mobile_market_list("rise", "KOSPI"),
+        "price_down": get_mobile_market_list("fall", "KOSPI"),
     }
 
 @st.cache_data(ttl=300)
 def get_major_indices():
+    # 야후 파이낸스 글로벌 데이터로 지수 호출 (막힘 절대 없음)
+    indices = {"KOSPI": "^KS11", "KOSDAQ": "^KQ11", "NASDAQ": "^IXIC", "S&P 500": "^GSPC"}
     res = {}
-    try:
-        r = requests.get("https://finance.naver.com/", headers=NAVER_HEADERS, timeout=5)
-        r.encoding = 'euc-kr'
-        soup = BeautifulSoup(r.text, 'lxml')
-        for name, css_class in [("KOSPI", ".kospi_area"), ("KOSDAQ", ".kosdaq_area")]:
-            box = soup.select_one(css_class)
-            if box:
-                num_tag = box.select_one('.num')
-                num2_tag = box.select_one('.num2')
-                num3_tag = box.select_one('.num3')
-                price = float(num_tag.text.strip().replace(',', '')) if num_tag else 0.0
-                diff = float(num2_tag.text.strip().replace(',', '')) if num2_tag else 0.0
-                pct_text = num3_tag.text.strip().replace('%', '') if num3_tag else "0"
-                
-                state_tag = box.select_one('.blind')
-                is_down = False
-                if state_tag and "하락" in state_tag.text: is_down = True
-                if num2_tag and "txt_down" in "".join(num2_tag.get('class', [])): is_down = True
-                    
-                if is_down:
-                    diff = -abs(diff)
-                    if not pct_text.startswith("-"): pct_text = "-" + pct_text
-                try: pct = float(pct_text.replace('+', ''))
-                except: pct = 0.0
-                res[name] = {"price": price, "diff": diff, "pct": pct}
-    except Exception:
-        res["KOSPI"] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
-        res["KOSDAQ"] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
-        
-    us_indices = {"NASDAQ": "^IXIC", "S&P 500": "^GSPC"}
-    for name, ticker in us_indices.items():
+    for name, ticker in indices.items():
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             if len(hist) >= 2:
-                curr = hist['Close'].iloc[-1]
-                prev = hist['Close'].iloc[-2]
-                res[name] = {"price": curr, "diff": curr - prev, "pct": ((curr - prev) / prev) * 100}
+                curr = float(hist['Close'].iloc[-1])
+                prev = float(hist['Close'].iloc[-2])
+                diff = curr - prev
+                pct = (diff / prev) * 100
+                res[name] = {"price": curr, "diff": diff, "pct": pct}
+            else:
+                res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
         except:
             res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
     return res
@@ -172,16 +144,15 @@ def fetch_google_news(keyword, limit=5):
 @st.cache_data(ttl=1800)
 def get_trending_stocks_with_news():
     m_data = load_market_data()
-    search_top = m_data.get('search_top', pd.DataFrame())
-    volume_top = m_data.get('volume_top', pd.DataFrame())
+    pool = pd.concat([m_data.get('kospi_vol', pd.DataFrame()), m_data.get('kosdaq_vol', pd.DataFrame())])
+    if pool.empty: return []
     
-    if search_top.empty and volume_top.empty: return []
-    pool = pd.concat([search_top, volume_top]).drop_duplicates(subset=['종목명']).head(15)
+    pool = pool.drop_duplicates(subset=['종목명']).head(15)
     candidates = []
     
     for _, row in pool.iterrows():
         name = row['종목명']
-        ticker, is_us, mapped_name = get_ticker_from_naver(name)
+        ticker, _, _ = get_ticker_from_name(name)
         if not ticker: continue
         
         try:
@@ -209,10 +180,10 @@ def get_us_trending_stocks_with_news():
 def get_hidden_gem_stocks():
     m_data = load_market_data()
     noisy_stocks = set()
-    if not m_data.get('search_top', pd.DataFrame()).empty:
-        noisy_stocks.update(m_data['search_top']['종목명'].tolist())
-    if not m_data.get('volume_top', pd.DataFrame()).empty:
-        noisy_stocks.update(m_data['volume_top']['종목명'].tolist())
+    if not m_data.get('kospi_vol', pd.DataFrame()).empty:
+        noisy_stocks.update(m_data['kospi_vol']['종목명'].tolist())
+    if not m_data.get('kosdaq_vol', pd.DataFrame()).empty:
+        noisy_stocks.update(m_data['kosdaq_vol']['종목명'].tolist())
         
     kospi_cap = m_data.get('kospi_cap', pd.DataFrame())
     kosdaq_cap = m_data.get('kosdaq_cap', pd.DataFrame())
@@ -224,7 +195,7 @@ def get_hidden_gem_stocks():
     candidates = []
     for _, row in sampled_pool.iterrows():
         name = row['종목명']
-        ticker, is_us, mapped_name = get_ticker_from_naver(name)
+        ticker, _, _ = get_ticker_from_name(name)
         if not ticker: continue
         
         try:
@@ -258,25 +229,14 @@ def get_peer_group(company_name):
     else: peers = []
     return [p for p in peers if p != company_name][:3]
 
-def get_fundamentals(ticker, is_us_stock):
+def get_fundamentals(ticker):
+    # 크롤링을 없애고 야후 파이낸스에서 PER/PBR 직접 추출 (한국/미국 종목 모두 호환)
     per, pbr = "N/A", "N/A"
-    if is_us_stock:
-        try:
-            info = yf.Ticker(ticker).info
-            if info.get('trailingPE'): per = f"{info['trailingPE']:.2f}배"
-            if info.get('priceToBook'): pbr = f"{info['priceToBook']:.2f}배"
-        except: pass
-    else:
-        try:
-            raw_code = ticker.split('.')[0]
-            url = f"https://finance.naver.com/item/main.naver?code={raw_code}"
-            res = requests.get(url, headers=NAVER_HEADERS, timeout=5)
-            soup = BeautifulSoup(res.text, 'lxml')
-            per_tag = soup.select_one('#_per')
-            pbr_tag = soup.select_one('#_pbr')
-            if per_tag and per_tag.text.strip(): per = per_tag.text.strip() + "배"
-            if pbr_tag and pbr_tag.text.strip(): pbr = pbr_tag.text.strip() + "배"
-        except: pass
+    try:
+        info = yf.Ticker(ticker).info
+        if info.get('trailingPE'): per = f"{info['trailingPE']:.2f}배"
+        if info.get('priceToBook'): pbr = f"{info['priceToBook']:.2f}배"
+    except: pass
     return per, pbr
 
 @st.cache_data(ttl=3600)
@@ -336,9 +296,9 @@ def get_ai_response(prompt_text, api_key, model_choice, instruction_text, is_jso
         return None, None
 
 def run_quick_analysis(company_name, api_key, model_choice):
-    ticker, is_us_stock, display_name = get_ticker_from_naver(company_name)
+    ticker, is_us_stock, display_name = get_ticker_from_name(company_name)
     if not ticker:
-        st.error(f"'{company_name}' 종목의 코드를 찾지 못했습니다. 네이버 금융에서 검색되는 정확한 이름을 입력해 주세요.")
+        st.error(f"'{company_name}' 종목의 코드를 찾지 못했습니다. 정확한 상장명인지 확인해 주세요.")
         return
 
     st.session_state.current_stock = display_name
@@ -362,7 +322,7 @@ def run_quick_analysis(company_name, api_key, model_choice):
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             current_rsi = (100 - (100 / (1 + (gain / loss)))).iloc[-1] if not gain.isna().all() else 50
 
-            per, pbr = get_fundamentals(ticker, is_us_stock)
+            per, pbr = get_fundamentals(ticker)
             news_list = fetch_google_news(display_name, limit=3)
             news_text = "\n".join([f"- {news}" for news in news_list]) if news_list else "최근 주요 뉴스 없음"
 
@@ -438,14 +398,14 @@ tab_main, tab_search, tab_recommend, tab_backtest, tab_chat = st.tabs([
 with tab_main:
     m_data = load_market_data()
     if all(df.empty for df in m_data.values()):
-        st.error("🚨 네이버 금융 서버 접속이 지연되고 있습니다. 잠시 후 새로고침 해주세요.")
+        st.error("🚨 글로벌 금융 데이터 서버에서 정보를 불러오고 있습니다. 새로고침(F5)을 눌러주세요.")
     else:
-        t1, t2, t3, t4, t5, t6 = st.tabs(["👑 KOSPI 시총상위", "👑 KOSDAQ 시총상위", "🔥 검색량 상위", "🌊 거래량 상위", "🚀 상승률 상위", "📉 하락률 상위"])
+        t1, t2, t3, t4, t5, t6 = st.tabs(["👑 KOSPI 시총상위", "👑 KOSDAQ 시총상위", "🌊 KOSPI 거래량", "🌊 KOSDAQ 거래량", "🚀 상승률 상위", "📉 하락률 상위"])
         events = {}
         with t1: events['kospi_cap']  = st.dataframe(m_data['kospi_cap'],  use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t1")
         with t2: events['kosdaq_cap'] = st.dataframe(m_data['kosdaq_cap'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t2")
-        with t3: events['search_top'] = st.dataframe(m_data['search_top'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t3")
-        with t4: events['volume_top'] = st.dataframe(m_data['volume_top'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t4")
+        with t3: events['kospi_vol']  = st.dataframe(m_data['kospi_vol'],  use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t3")
+        with t4: events['kosdaq_vol'] = st.dataframe(m_data['kosdaq_vol'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t4")
         with t5: events['price_up']   = st.dataframe(m_data['price_up'],   use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t5")
         with t6: events['price_down'] = st.dataframe(m_data['price_down'], use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key="t6")
 
@@ -466,7 +426,7 @@ with tab_search:
     analyze_btn  = st.button("심층 펀더멘털 분석 시작")
     
     if analyze_btn and company_name:
-        ticker, is_us_stock, display_name = get_ticker_from_naver(company_name)
+        ticker, is_us_stock, display_name = get_ticker_from_name(company_name)
         if not ticker: st.error("종목을 찾을 수 없습니다. 정확한 종목명을 입력하세요.")
         else:
             st.session_state.current_stock = display_name
@@ -475,7 +435,7 @@ with tab_search:
                 hist = stock_data.history(period="6mo")
                 if not hist.empty:
                     current_price = hist['Close'].iloc[-1]
-                    per, pbr = get_fundamentals(ticker, is_us_stock)
+                    per, pbr = get_fundamentals(ticker)
                     macro = get_macro_data()
                     news_list = fetch_google_news(display_name, limit=5)
                     news_text = "\n".join([f"- {news}" for news in news_list]) if news_list else "최근 주요 뉴스 없음"
@@ -483,9 +443,9 @@ with tab_search:
                     peers = get_peer_group(display_name)
                     peer_data = []
                     for p in peers:
-                        p_ticker, p_is_us, p_name = get_ticker_from_naver(p)
+                        p_ticker, _, p_name = get_ticker_from_name(p)
                         if p_ticker:
-                            p_per, p_pbr = get_fundamentals(p_ticker, p_is_us)
+                            p_per, p_pbr = get_fundamentals(p_ticker)
                             peer_data.append({"기업명": p_name, "PER": p_per, "PBR": p_pbr})
 
                     currency_sym = "$" if is_us_stock else "₩"
@@ -530,7 +490,7 @@ with tab_recommend:
                 trending_data = get_hidden_gem_stocks() if is_hidden_gem else get_trending_stocks_with_news()
                 currency = "₩"
 
-            if not trending_data: st.error("❌ 시장 데이터를 가져오지 못했습니다.")
+            if not trending_data: st.error("❌ 시장 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
             else:
                 instruction = "당신은 탁월한 퀀트 매니저입니다. [{'stock':'종목명','current_price':'숫자만','sentiment':'진짜 호재 요약','reason':'추천 사유'}] 형식의 JSON 배열로 응답하세요."
                 strategy_prompt = "저평가 턴어라운드 가치주(Hidden Gem) 상위 5개를 추천해" if is_hidden_gem else "모멘텀이 강력한 유망 주도주 상위 5개를 추천해"
@@ -562,7 +522,7 @@ with tab_backtest:
         run_bt = st.button("백테스트 시작")
     with col2:
         if run_bt and test_ticker_input:
-            t_code, _, t_name = get_ticker_from_naver(test_ticker_input)
+            t_code, _, t_name = get_ticker_from_name(test_ticker_input)
             if t_code:
                 st.session_state.current_stock = t_name 
                 with st.spinner("시뮬레이션 중..."):

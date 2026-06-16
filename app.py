@@ -1,5 +1,6 @@
 import streamlit as st
 import re
+import sys
 
 st.set_page_config(page_title="AI 글로벌 퀀트 터미널", layout="wide", page_icon="📈")
 
@@ -64,13 +65,18 @@ def get_kis_token():
             headers={"Content-Type": "application/json"},
             timeout=10
         )
+        # 🟢 응답 코드가 200(정상)이 아닐 경우 사이드바에 에러 메시지를 강제 출력
+        if res.status_code != 200:
+            st.sidebar.error(f"KIS 토큰 발급 거부됨: {res.text}")
+            return None
+            
         token = res.json().get("access_token")
         if token:
             st.session_state.kis_token        = token
             st.session_state.kis_token_expire = now + timedelta(hours=11)
             return token
-    except:
-        pass
+    except Exception as e:
+        st.sidebar.error(f"KIS 접속 아예 실패: {e}")
     return None
 
 def kis_headers(tr_id, token):

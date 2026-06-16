@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
-from pykrx import stock as pykrx_stock
+import FinanceDataReader as fdr
 
 # ==========================================
 # 세션 초기화
@@ -26,71 +26,41 @@ if "current_stock" not in st.session_state:
 US_STOCKS = {"애플": "AAPL", "엔비디아": "NVDA", "테슬라": "TSLA", "마이크로소프트": "MSFT"}
 
 # ==========================================
-# 1. 핵심 데이터 수집 (pykrx 기반 - KRX 직접 연동)
+# 1. 핵심 데이터 수집 함수
 # ==========================================
 
 @st.cache_data(ttl=3600)
 def get_krx_full_data():
     """
-    pykrx로 KRX 전 종목의 실시간 시세 + PER/PBR을 한 번에 가져옵니다.
-    네이버/HTS와 동일한 KRX 공식 수치입니다.
+    FDR로 전 종목 시세/시가총액/거래량 가져오고,
+    PER/PBR은 Daum API로 보완합니다.
     """
     try:
-        today = datetime.now().strftime('%Y%m%d')
-        
-        # 오늘 장중이면 오늘 날짜, 휴장이면 가장 최근 거래일 자동 처리
-        # KOSPI + KOSDAQ 시세 (현재가, 거래량, 시가총액)
-        df_ohlcv_kospi  = pykrx_stock.get_market_ohlcv_by_ticker(today, market="KOSPI")
-        df_ohlcv_kosdaq = pykrx_stock.get_market_ohlcv_by_ticker(today, market="KOSDAQ")
-        
-        # PER, PBR (KRX 공식 - TTM 기준, 네이버와 동일)
-        df_fund_kospi  = pykrx_stock.get_market_fundamental_by_ticker(today, market="KOSPI")
-        df_fund_kosdaq = pykrx_stock.get_market_fundamental_by_ticker(today, market="KOSDAQ")
-        
-        # 시가총액
-        df_cap_kospi  = pykrx_stock.get_market_cap_by_ticker(today, market="KOSPI")
-        df_cap_kosdaq = pykrx_stock.get_market_cap_by_ticker(today, market="KOSDAQ")
-        
-        # 종목명 매핑
-        tickers_kospi  = pykrx_stock.get_market_ticker_list(today, market="KOSPI")
-        tickers_kosdaq = pykrx_stock.get_market_ticker_list(today, market="KOSDAQ")
-        
-        name_map = {}
-        for t in tickers_kospi:
-            name_map[t] = pykrx_stock.get_market_ticker_name(t)
-        for t in tickers_kosdaq:
-            name_map[t] = pykrx_stock.get_market_ticker_name(t)
-        
-        def build_df(df_ohlcv, df_fund, df_cap, market_label):
-            df = df_ohlcv[['종가', '거래량', '등락률']].copy()
-            df.columns = ['Close', 'Volume', 'ChgRate']
-            
-            if not df_fund.empty:
-                df = df.join(df_fund[['PER', 'PBR']], how='left')
-            else:
-                df['PER'] = np.nan
-                df['PBR'] = np.nan
-                
-            if not df_cap.empty and '시가총액' in df_cap.columns:
-                df = df.join(df_cap[['시가총액']].rename(columns={'시가총액': 'Marcap'}), how='left')
-            else:
-                df['Marcap'] = np.nan
-                
-            df['Market'] = market_label
-            df['Name'] = df.index.map(name_map)
-            df['Code'] = df.index
-            return df
-        
-        df_kospi  = build_df(df_ohlcv_kospi,  df_fund_kospi,  df_cap_kospi,  'KOSPI')
-        df_kosdaq = build_df(df_ohlcv_kosdaq, df_fund_kosdaq, df_cap_kosdaq, 'KOSDAQ')
-        
+        df_kospi  = fdr.StockListing('KOSPI')
+        df_kosdaq = fdr.StockListing('KOSDAQ')
+
+        df_kospi['Market']  = 'KOSPI'
+        df_kosdaq['Market'] = 'KOSDAQ'
         df = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
-        df = df.dropna(subset=['Name', 'Code'])
-        
-        for col in ['Close', 'ChgRate', 'Volume', 'Marcap', 'PER', 'PBR']:
+
+        # 확인된 실제 컬럼명 기준으로 정확히 매핑
+        col_map = {
+            'ChagesRatio': 'ChgRate',  # FDR 오타 수정
+            'Changes':     'Changes',
+        }
+        df.rename(columns=col_map, inplace=True)
+
+        # PER/PBR은 FDR StockListing에 없으므로 빈 컬럼으로 초기화
+        df['PER'] = np.nan
+        df['PBR'] = np.nan
+
+        keep = [c for c in ['Name','Code','Market','Close','ChgRate','Volume','Marcap','PER','PBR'] if c in df.columns]
+        df = df[keep].dropna(subset=['Name','Code'])
+
+        for col in ['Close','ChgRate','Volume','Marcap']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-        
+
         return df
     except Exception as e:
         st.error(f"KRX 데이터 로딩 실패: {e}")
@@ -102,24 +72,21 @@ def get_ticker_from_name(name, df_krx):
     if re.match(r'^[A-Za-z]+$', name): return name.upper(), True, name.upper()
 
     if not df_krx.empty and 'Name' in df_krx.columns:
-        clean_input = name.replace(" ", "").upper()
-        
-        exact = df_krx[df_krx['Name'].str.replace(" ", "").str.upper() == clean_input]
+        clean_input = name.replace(" ","").upper()
+        exact = df_krx[df_krx['Name'].str.replace(" ","").str.upper() == clean_input]
         if not exact.empty:
             row = exact.iloc[0]
             suffix = '.KQ' if row.get('Market') == 'KOSDAQ' else '.KS'
             return f"{row['Code']}{suffix}", False, row['Name']
-        
-        partial = df_krx[df_krx['Name'].str.replace(" ", "").str.upper().str.contains(clean_input, na=False)]
+        partial = df_krx[df_krx['Name'].str.replace(" ","").str.upper().str.contains(clean_input, na=False)]
         if not partial.empty:
             row = partial.iloc[0]
             suffix = '.KQ' if row.get('Market') == 'KOSDAQ' else '.KS'
             return f"{row['Code']}{suffix}", False, row['Name']
 
-    # 마지막 수단: 네이버 자동완성
     try:
-        encoded_keyword = urllib.parse.quote(name.encode('euc-kr'))
-        url = f"https://ac.finance.naver.com/ac?q={encoded_keyword}&q_enc=euc-kr&st=111&r_format=json&r_enc=utf-8"
+        encoded = urllib.parse.quote(name.encode('euc-kr'))
+        url = f"https://ac.finance.naver.com/ac?q={encoded}&q_enc=euc-kr&st=111&r_format=json&r_enc=utf-8"
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         items = res.json().get('items', [[]])[0]
         if items:
@@ -133,55 +100,33 @@ def get_ticker_from_name(name, df_krx):
 def get_ranking_tables(df_krx):
     if df_krx.empty:
         return {k: pd.DataFrame() for k in ['kospi_cap','kosdaq_cap','kospi_vol','kosdaq_vol','price_up','price_down']}
-    
+
     kospi  = df_krx[df_krx['Market'] == 'KOSPI'].copy()
     kosdaq = df_krx[df_krx['Market'] == 'KOSDAQ'].copy()
-    
+
     def make_table(df, sort_col, ascending=False, n=30):
         if sort_col not in df.columns or df.empty:
             return pd.DataFrame()
         df = df[df[sort_col].notna()].sort_values(sort_col, ascending=ascending).head(n)
-        cols = ['Name','Close','ChgRate','Volume','Marcap','PER','PBR']
-        cols = [c for c in cols if c in df.columns]
+        cols = [c for c in ['Name','Close','ChgRate','Volume','Marcap'] if c in df.columns]
         result = df[cols].copy()
-        rename = {
-            'Name':'종목명','Close':'현재가','ChgRate':'등락률(%)',
-            'Volume':'거래량','Marcap':'시가총액','PER':'PER','PBR':'PBR'
-        }
+        rename = {'Name':'종목명','Close':'현재가','ChgRate':'등락률(%)','Volume':'거래량','Marcap':'시가총액'}
         return result.rename(columns=rename).reset_index(drop=True)
-    
+
     return {
-        'kospi_cap':  make_table(kospi,   'Marcap',  ascending=False),
-        'kosdaq_cap': make_table(kosdaq,  'Marcap',  ascending=False),
-        'kospi_vol':  make_table(kospi,   'Volume',  ascending=False),
-        'kosdaq_vol': make_table(kosdaq,  'Volume',  ascending=False),
-        'price_up':   make_table(df_krx,  'ChgRate', ascending=False),
-        'price_down': make_table(df_krx,  'ChgRate', ascending=True),
+        'kospi_cap':  make_table(kospi,  'Marcap',  ascending=False),
+        'kosdaq_cap': make_table(kosdaq, 'Marcap',  ascending=False),
+        'kospi_vol':  make_table(kospi,  'Volume',  ascending=False),
+        'kosdaq_vol': make_table(kosdaq, 'Volume',  ascending=False),
+        'price_up':   make_table(df_krx, 'ChgRate', ascending=False),
+        'price_down': make_table(df_krx, 'ChgRate', ascending=True),
     }
 
 @st.cache_data(ttl=300)
 def get_major_indices():
-    """pykrx로 KOSPI/KOSDAQ 지수, Yahoo로 해외 지수"""
+    indices = {"KOSPI": "^KS11", "KOSDAQ": "^KQ11", "NASDAQ": "^IXIC", "S&P 500": "^GSPC"}
     res = {}
-    try:
-        today = datetime.now().strftime('%Y%m%d')
-        for name, market in [("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")]:
-            try:
-                df = pykrx_stock.get_index_ohlcv_by_date(
-                    (datetime.now() - timedelta(days=7)).strftime('%Y%m%d'),
-                    today, market
-                )
-                if not df.empty and len(df) >= 2:
-                    curr = float(df['종가'].iloc[-1])
-                    prev = float(df['종가'].iloc[-2])
-                    res[name] = {"price": curr, "diff": curr-prev, "pct": ((curr-prev)/prev)*100}
-                else:
-                    res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
-            except:
-                res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
-    except: pass
-
-    for name, ticker in [("NASDAQ", "^IXIC"), ("S&P 500", "^GSPC")]:
+    for name, ticker in indices.items():
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             if len(hist) >= 2:
@@ -202,19 +147,44 @@ def get_macro_data():
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             data[key] = round(hist['Close'].iloc[-1], 2) if not hist.empty else "N/A"
-        except: data[key] = "N/A"
+        except:
+            data[key] = "N/A"
     return data
 
 def fetch_google_news(keyword, limit=5):
     try:
-        encoded_keyword = urllib.parse.quote(keyword)
-        url = f"https://news.google.com/rss/search?q={encoded_keyword}&hl=ko&gl=KR&ceid=KR:ko"
+        encoded = urllib.parse.quote(keyword)
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=ko&gl=KR&ceid=KR:ko"
         feed = feedparser.parse(url)
         return [entry.title for entry in feed.entries[:limit]]
-    except: return []
+    except:
+        return []
 
-# 🔥 PER/PBR: pykrx KRX 공식 데이터에서 직접 읽기 (네이버와 동일)
-def get_fundamentals(ticker, is_us_stock, df_krx):
+# 🔥 PER/PBR: Daum Finance API (네이버와 동일한 KRX TTM 기준 수치 제공)
+@st.cache_data(ttl=3600)
+def get_per_pbr_from_daum(raw_code):
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': f'https://finance.daum.net/quotes/A{raw_code}',
+            'Accept': 'application/json, text/plain, */*',
+        }
+        res = requests.get(
+            f"https://finance.daum.net/api/quotes/A{raw_code}",
+            headers=headers, timeout=5
+        )
+        if res.status_code == 200:
+            data = res.json()
+            per = data.get('per')
+            pbr = data.get('pbr')
+            per_str = f"{float(per):.2f}배" if per and float(per) > 0 else "N/A"
+            pbr_str = f"{float(pbr):.2f}배" if pbr and float(pbr) > 0 else "N/A"
+            return per_str, pbr_str
+    except:
+        pass
+    return "N/A", "N/A"
+
+def get_fundamentals(ticker, is_us_stock):
     per, pbr = "N/A", "N/A"
 
     if is_us_stock:
@@ -225,52 +195,30 @@ def get_fundamentals(ticker, is_us_stock, df_krx):
         except: pass
     else:
         raw_code = ticker.split('.')[0]
-        
-        # [플랜 A] pykrx KRX 공식 수치 (네이버와 동일한 TTM 기준)
-        if not df_krx.empty and 'PER' in df_krx.columns:
-            match = df_krx[df_krx['Code'] == raw_code]
-            if not match.empty:
-                p = match.iloc[0].get('PER')
-                b = match.iloc[0].get('PBR')
-                if pd.notna(p) and float(p) > 0: per = f"{float(p):.2f}배"
-                if pd.notna(b) and float(b) > 0: pbr = f"{float(b):.2f}배"
-
-        # [플랜 B] pykrx 개별 종목 직접 조회
-        if per == "N/A" or pbr == "N/A":
-            try:
-                today = datetime.now().strftime('%Y%m%d')
-                df_fund = pykrx_stock.get_market_fundamental_by_ticker(today, market="ALL")
-                if raw_code in df_fund.index:
-                    p = df_fund.loc[raw_code, 'PER']
-                    b = df_fund.loc[raw_code, 'PBR']
-                    if pd.notna(p) and float(p) > 0: per = f"{float(p):.2f}배"
-                    if pd.notna(b) and float(b) > 0: pbr = f"{float(b):.2f}배"
-            except: pass
+        # Daum API (네이버와 동일한 KRX TTM 기준)
+        per, pbr = get_per_pbr_from_daum(raw_code)
 
     return per, pbr
 
-# 🔥 pykrx 기반 실시간 주가 조회 (수정주가 문제 해결)
-def get_stock_history(ticker, is_us_stock, period_days=180):
-    """
-    한국 주식: pykrx로 실제 거래가(비수정) 조회
-    미국 주식: Yahoo Finance 조회
-    """
-    if is_us_stock:
-        hist = yf.Ticker(ticker).history(period="6mo", auto_adjust=False)
-        return hist
-    else:
-        try:
-            raw_code = ticker.split('.')[0]
-            end_date = datetime.now().strftime('%Y%m%d')
-            start_date = (datetime.now() - timedelta(days=period_days)).strftime('%Y%m%d')
-            df = pykrx_stock.get_market_ohlcv_by_date(start_date, end_date, raw_code)
-            if df.empty: return pd.DataFrame()
-            # Yahoo Finance 형식에 맞게 컬럼명 변환
-            df = df.rename(columns={'시가':'Open','고가':'High','저가':'Low','종가':'Close','거래량':'Volume'})
+def get_stock_history_kr(raw_code, period_days=180):
+    """한국 주식 실제 거래가 (FDR 사용, 수정주가 문제 없음)"""
+    try:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=period_days)).strftime('%Y-%m-%d')
+        df = fdr.DataReader(raw_code, start_date, end_date)
+        if not df.empty and 'Close' in df.columns:
             return df
-        except:
-            # pykrx 실패 시 Yahoo로 대체
-            return yf.Ticker(ticker).history(period="6mo", auto_adjust=False)
+    except:
+        pass
+    # FDR 실패 시 Yahoo로 폴백
+    try:
+        for suffix in ['.KS', '.KQ']:
+            hist = yf.Ticker(f"{raw_code}{suffix}").history(period="6mo", auto_adjust=False)
+            if not hist.empty:
+                return hist
+    except:
+        pass
+    return pd.DataFrame()
 
 @st.cache_data(ttl=1800)
 def get_trending_stocks_with_news(df_krx):
@@ -279,12 +227,10 @@ def get_trending_stocks_with_news(df_krx):
     pool = df_krx[df_krx['Volume'].notna()].sort_values('Volume', ascending=False).head(20)
     candidates = []
     for _, row in pool.iterrows():
-        name = str(row.get('Name', ''))
-        code = str(row.get('Code', ''))
-        market = str(row.get('Market', ''))
-        ticker = f"{code}.KQ" if 'KOSDAQ' in market else f"{code}.KS"
+        name = str(row.get('Name',''))
+        code = str(row.get('Code',''))
         try:
-            hist = get_stock_history(ticker, False, 5)
+            hist = get_stock_history_kr(code, 5)
             if not hist.empty:
                 candidates.append({
                     "종목명": name,
@@ -299,20 +245,18 @@ def get_hidden_gem_stocks(df_krx):
     if df_krx.empty or 'Marcap' not in df_krx.columns:
         return []
     pool = df_krx[df_krx['Marcap'].notna()].sort_values('Marcap', ascending=False).head(200)
-    if 'Volume' in pool.columns and 'PBR' in pool.columns:
+    if 'Volume' in pool.columns:
         vol_median = pool['Volume'].median()
-        filtered = pool[(pool['Volume'] < vol_median) & (pool['PBR'].notna()) & (pool['PBR'] > 0)]
+        filtered = pool[pool['Volume'] < vol_median]
         if not filtered.empty:
-            pool = filtered.sort_values('PBR', ascending=True).head(40)
+            pool = filtered.head(60)
     sampled = pool.sample(n=min(15, len(pool))) if not pool.empty else pool
     candidates = []
     for _, row in sampled.iterrows():
-        name = str(row.get('Name', ''))
-        code = str(row.get('Code', ''))
-        market = str(row.get('Market', ''))
-        ticker = f"{code}.KQ" if 'KOSDAQ' in market else f"{code}.KS"
+        name = str(row.get('Name',''))
+        code = str(row.get('Code',''))
         try:
-            hist = get_stock_history(ticker, False, 5)
+            hist = get_stock_history_kr(code, 5)
             if not hist.empty:
                 candidates.append({
                     "종목명": name,
@@ -330,24 +274,24 @@ def get_us_trending_stocks_with_news():
         try:
             hist = yf.Ticker(ticker).history(period="5d", auto_adjust=False)
             if not hist.empty:
-                candidates.append({"종목명": ticker, "현재가": round(float(hist['Close'].iloc[-1]), 2), "최신뉴스": fetch_google_news(f"{ticker} 주식", limit=3)})
+                candidates.append({"종목명": ticker, "현재가": round(float(hist['Close'].iloc[-1]),2), "최신뉴스": fetch_google_news(f"{ticker} 주식", limit=3)})
         except: pass
     return candidates
 
 @st.cache_data(ttl=1800)
 def get_us_hidden_gems_with_news():
-    us_value_pool = ['PYPL','DIS','PFE','NKE','SBUX','BA','INTC','C','WFC','T','VZ','O','QCOM','TXN','CVX']
+    us_pool = ['PYPL','DIS','PFE','NKE','SBUX','BA','INTC','C','WFC','T','VZ','O','QCOM','TXN','CVX']
     candidates = []
-    for ticker in us_value_pool:
+    for ticker in us_pool:
         try:
             hist = yf.Ticker(ticker).history(period="5d", auto_adjust=False)
             if not hist.empty:
-                candidates.append({"종목명": ticker, "현재가": round(float(hist['Close'].iloc[-1]), 2), "최신뉴스": fetch_google_news(f"{ticker} stock", limit=3)})
+                candidates.append({"종목명": ticker, "현재가": round(float(hist['Close'].iloc[-1]),2), "최신뉴스": fetch_google_news(f"{ticker} stock", limit=3)})
         except: pass
     return candidates
 
 def get_peer_group(company_name):
-    name = company_name.replace(" ", "")
+    name = company_name.replace(" ","")
     if "엔비티" in name or "노바렉스" in name or "서흥" in name: peers = ["노바렉스","서흥","콜마비앤에이치"]
     elif "콜마" in name or "코스맥스" in name or "코스메카" in name: peers = ["한국콜마","코스메카코리아","씨앤씨인터내셔널"]
     elif "삼성전자" in name or "SK하이닉스" in name: peers = ["SK하이닉스","한미반도체","DB하이텍"]
@@ -357,12 +301,14 @@ def get_peer_group(company_name):
     return [p for p in peers if p != company_name][:3]
 
 @st.cache_data(ttl=3600)
-def run_backtest(ticker, is_us_stock, start_years=3):
+def run_backtest(raw_code, is_us_stock, start_years=3):
     try:
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=365*start_years)
-        df = get_stock_history(ticker, is_us_stock, 365*start_years)
-        if df.empty: return None
+        if is_us_stock:
+            df = yf.Ticker(raw_code).history(period=f"{start_years}y", auto_adjust=False)
+        else:
+            df = get_stock_history_kr(raw_code, 365*start_years)
+        if df is None or df.empty: return None
+
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
         delta = df['Close'].diff()
@@ -399,7 +345,8 @@ def get_ai_response(prompt_text, api_key, model_choice, instruction_text, is_jso
             if clean_text.startswith(ticks):
                 clean_text = clean_text.replace(ticks+"json","").replace(ticks,"").strip()
             return json.loads(clean_text), called_at
-        else: return clean_text, called_at
+        else:
+            return clean_text, called_at
     except Exception as e:
         st.error(f"⚠️ AI 연산 오류: {e}")
         return None, None
@@ -413,7 +360,8 @@ def run_quick_analysis(company_name, api_key, model_choice, df_krx):
     st.session_state.current_stock = display_name
     with st.spinner(f"'{display_name}' 실시간 퀵 스캔 중..."):
         try:
-            hist = get_stock_history(ticker, is_us_stock, 180)
+            raw_code = ticker.split('.')[0]
+            hist = get_stock_history_kr(raw_code, 180) if not is_us_stock else yf.Ticker(ticker).history(period="6mo", auto_adjust=False)
             if hist.empty:
                 st.error("주가 데이터를 불러오지 못했습니다.")
                 return
@@ -429,7 +377,7 @@ def run_quick_analysis(company_name, api_key, model_choice, df_krx):
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             current_rsi = (100 - (100 / (1 + (gain/loss)))).iloc[-1] if not gain.isna().all() else 50
 
-            per, pbr = get_fundamentals(ticker, is_us_stock, df_krx)
+            per, pbr = get_fundamentals(ticker, is_us_stock)
             news_list = fetch_google_news(display_name, limit=3)
             news_text = "\n".join([f"- {n}" for n in news_list]) if news_list else "최근 주요 뉴스 없음"
 
@@ -538,10 +486,11 @@ with tab_search:
         else:
             st.session_state.current_stock = display_name
             with st.spinner(f"'{display_name}' 데이터 수집 중..."):
-                hist = get_stock_history(ticker, is_us_stock, 180)
+                raw_code = ticker.split('.')[0]
+                hist = get_stock_history_kr(raw_code, 180) if not is_us_stock else yf.Ticker(ticker).history(period="6mo", auto_adjust=False)
                 if not hist.empty:
                     current_price = hist['Close'].iloc[-1]
-                    per, pbr = get_fundamentals(ticker, is_us_stock, df_krx)
+                    per, pbr = get_fundamentals(ticker, is_us_stock)
                     macro = get_macro_data()
                     news_list = fetch_google_news(display_name, limit=5)
                     news_text = "\n".join([f"- {n}" for n in news_list]) if news_list else "최근 주요 뉴스 없음"
@@ -551,7 +500,7 @@ with tab_search:
                     for p in peers:
                         p_ticker, p_is_us, p_name = get_ticker_from_name(p, df_krx)
                         if p_ticker:
-                            p_per, p_pbr = get_fundamentals(p_ticker, p_is_us, df_krx)
+                            p_per, p_pbr = get_fundamentals(p_ticker, p_is_us)
                             peer_data.append({"기업명": p_name, "PER": p_per, "PBR": p_pbr})
 
                     currency_sym = "$" if is_us_stock else "₩"
@@ -571,8 +520,8 @@ with tab_search:
                         st.success(f"✅ {display_name} 심층 리포트 완료")
                         col1, col2 = st.columns([1, 2])
                         with col1:
-                            st.metric(f"PER", per)
-                            st.metric(f"PBR", pbr)
+                            st.metric("PER", per)
+                            st.metric("PBR", pbr)
                             if peer_data: st.dataframe(pd.DataFrame(peer_data), hide_index=True)
                             st.line_chart(hist['Close'])
                         with col2:
@@ -627,11 +576,12 @@ with tab_backtest:
         run_bt = st.button("백테스트 시작")
     with col2:
         if run_bt and test_input:
-            t_code, t_is_us, t_name = get_ticker_from_name(test_input, df_krx)
-            if t_code:
+            t_ticker, t_is_us, t_name = get_ticker_from_name(test_input, df_krx)
+            if t_ticker:
+                t_raw = t_ticker.split('.')[0]
                 st.session_state.current_stock = t_name
                 with st.spinner("시뮬레이션 중..."):
-                    bt_df = run_backtest(t_code, t_is_us, test_years)
+                    bt_df = run_backtest(t_raw if not t_is_us else t_ticker, t_is_us, test_years)
                     if bt_df is not None and not bt_df.empty:
                         mr = (bt_df['Cumulative_Market'].iloc[-1]-1)*100
                         sr = (bt_df['Cumulative_Strategy'].iloc[-1]-1)*100

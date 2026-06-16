@@ -77,7 +77,6 @@ def kis_headers(tr_id, token):
 
 @st.cache_data(ttl=60)
 def get_kis_price(code):
-    """KIS 실시간 현재가 + PER/PBR/EPS/BPS 포함"""
     token = get_kis_token()
     if not token:
         return None
@@ -112,7 +111,6 @@ def get_kis_price(code):
 
 @st.cache_data(ttl=60)
 def get_kis_volume_rank(market="J"):
-    """KIS 거래량 순위"""
     token = get_kis_token()
     if not token:
         return []
@@ -154,35 +152,69 @@ def get_kis_volume_rank(market="J"):
         return []
 
 # ==========================================
-# 2. 네이버 모바일 API (시총/등락 순위)
+# 2. 네이버 모바일 API
 # ==========================================
 
-@st.cache_data(ttl=60)
-def get_naver_marcap_rank(market="KOSPI", n=30):
-    rows = []
+def search_naver_stock(name):
+    """네이버 자동완성 - df_krx에 없는 종목도 검색 가능"""
     try:
         res = requests.get(
-            f"https://m.stock.naver.com/api/stocks/marketValue/{market}",
-            params={"page": 1, "pageSize": n},
-            headers=NAVER_MOBILE, timeout=5
+            "https://ac.stock.naver.com/ac",
+            params={"q": name, "target": "stock,index,fund,futures,option"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5
         )
-        for s in res.json().get("stocks", []):
-            code       = s.get("itemCode", "")
-            suffix     = ".KQ" if market == "KOSDAQ" else ".KS"
-            marcap_raw = str(s.get("marketValue", "0")).replace(",", "")
-            rows.append({
-                "Name":    s.get("stockName", ""),
-                "Code":    code,
-                "Ticker":  f"{code}{suffix}",
-                "Market":  market,
-                "Close":   float(str(s.get("closePrice",               "0")).replace(",", "")),
-                "ChgRate": float(str(s.get("fluctuationsRatio",        "0")).replace(",", "")),
-                "Volume":  float(str(s.get("accumulatedTradingVolume", "0")).replace(",", "")),
-                "Marcap":  float(marcap_raw) * 100_000_000 if marcap_raw else 0,
-            })
+        data       = res.json()
+        items_list = data.get("items", [])
+        if items_list and items_list[0]:
+            item       = items_list[0][0]
+            code       = item.get("code", "")
+            stock_name = item.get("name", name)
+            type_code  = str(item.get("typeCode", ""))
+            suffix     = ".KQ" if type_code == "12" else ".KS"
+            if code:
+                return f"{code}{suffix}", stock_name
     except:
         pass
-    return rows
+    return None, None
+
+@st.cache_data(ttl=60)
+def get_naver_marcap_rank(market="KOSPI", n=100):
+    rows     = []
+    page     = 1
+    per_page = 60
+    while len(rows) < n:
+        try:
+            res = requests.get(
+                f"https://m.stock.naver.com/api/stocks/marketValue/{market}",
+                params={"page": page, "pageSize": per_page},
+                headers=NAVER_MOBILE, timeout=5
+            )
+            data   = res.json()
+            stocks = data.get("stocks", [])
+            if not stocks:
+                break
+            for s in stocks:
+                code       = s.get("itemCode", "")
+                suffix     = ".KQ" if market == "KOSDAQ" else ".KS"
+                marcap_raw = str(s.get("marketValue", "0")).replace(",", "")
+                rows.append({
+                    "Name":    s.get("stockName", ""),
+                    "Code":    code,
+                    "Ticker":  f"{code}{suffix}",
+                    "Market":  market,
+                    "Close":   float(str(s.get("closePrice",               "0")).replace(",", "")),
+                    "ChgRate": float(str(s.get("fluctuationsRatio",        "0")).replace(",", "")),
+                    "Volume":  float(str(s.get("accumulatedTradingVolume", "0")).replace(",", "")),
+                    "Marcap":  float(marcap_raw) * 100_000_000 if marcap_raw else 0,
+                })
+            total = data.get("totalCount", 0)
+            if page * per_page >= total or len(rows) >= n:
+                break
+            page += 1
+        except:
+            break
+    return rows[:n]
 
 @st.cache_data(ttl=60)
 def get_naver_volume_rank(market="KOSPI", n=30):
@@ -245,8 +277,8 @@ def get_krx_full_data():
     rows  = []
     token = get_kis_token()
 
-    rows += get_naver_marcap_rank("KOSPI",  30)
-    rows += get_naver_marcap_rank("KOSDAQ", 30)
+    rows += get_naver_marcap_rank("KOSPI",  100)
+    rows += get_naver_marcap_rank("KOSDAQ", 100)
 
     if token:
         kis_kospi  = get_kis_volume_rank("J")
@@ -304,6 +336,7 @@ def get_ticker_from_name(name, df_krx=None):
     if re.match(r'^[A-Za-z]+$', name):
         return name.upper(), True, name.upper()
 
+    # 1순위: df_krx 내 검색
     if df_krx is not None and not df_krx.empty and "Name" in df_krx.columns:
         clean   = name.replace(" ", "").upper()
         exact   = df_krx[df_krx["Name"].str.replace(" ", "").str.upper() == clean]
@@ -315,6 +348,12 @@ def get_ticker_from_name(name, df_krx=None):
             row = partial.iloc[0]
             return row["Ticker"], False, row["Name"]
 
+    # 2순위: 네이버 자동완성
+    ticker, found_name = search_naver_stock(name)
+    if ticker:
+        return ticker, False, found_name
+
+    # 3순위: Yahoo Finance
     try:
         res = requests.get(
             "https://query1.finance.yahoo.com/v1/finance/search",
@@ -331,7 +370,7 @@ def get_ticker_from_name(name, df_krx=None):
     return None, False, name
 
 # ==========================================
-# 4. 주가 히스토리 (KIS 일봉 → Yahoo 폴백)
+# 4. 주가 히스토리
 # ==========================================
 
 @st.cache_data(ttl=300)
@@ -444,23 +483,18 @@ def get_fundamentals(ticker, is_us_stock, df_krx=None):
     return per, pbr
 
 # ==========================================
-# 6. 퀀트 팩터 스코어링 엔진
+# 6. 퀀트 팩터 스코어링
 # ==========================================
 
 @st.cache_data(ttl=3600)
 def get_factor_data(code):
-    """
-    KIS API 2번 호출로 4개 팩터 계산
-    - inquire-price       : PER, PBR, EPS, BPS → 밸류 + 퀄리티(ROE)
-    - inquire-daily-chart : 일봉 180일 → 모멘텀 + 저변동성
-    """
+    """KIS API 2번 호출로 4개 팩터 계산 - 순수 데이터 함수 (UI 없음)"""
     token = get_kis_token()
     if not token:
         return None
 
     result = {"code": code}
 
-    # 호출 1: 현재가 + 밸류 지표
     try:
         res = requests.get(
             f"{get_kis_base_url()}/uapi/domestic-stock/v1/quotations/inquire-price",
@@ -481,9 +515,9 @@ def get_factor_data(code):
         result["pbr"]   = sf(d.get("pbr"))
         result["eps"]   = sf(d.get("eps"))
         result["bps"]   = sf(d.get("bps"))
-        result["name"]  = d.get("hts_kor_isnm", code)
+        # KIS 종목명은 보조용으로만 저장 (나중에 네이버로 덮어씀)
+        result["name"]  = d.get("hts_kor_isnm", "")
 
-        # ROE = EPS / BPS
         if result["eps"] and result["bps"] and result["bps"] > 0:
             result["roe"] = result["eps"] / result["bps"] * 100
         else:
@@ -492,7 +526,6 @@ def get_factor_data(code):
     except:
         return None
 
-    # 호출 2: 일봉 → 모멘텀 + 저변동성
     try:
         end_date   = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
@@ -516,7 +549,6 @@ def get_factor_data(code):
                 p = str(row.get("stck_clpr","0")).replace(",","")
                 try: prices.append(float(p))
                 except: continue
-
             prices = list(reversed(prices))
             curr   = prices[-1]
 
@@ -538,32 +570,9 @@ def get_factor_data(code):
 
     return result
 
-@st.cache_data(ttl=3600)
-def run_factor_screening(df_krx, market_filter="전체"):
-    pool = df_krx.copy()
-    if market_filter != "전체":
-        pool = pool[pool["Market"] == market_filter]
-    pool = pool[pool["Marcap"] > 0].sort_values("Marcap", ascending=False).head(200)
 
-    if pool.empty:
-        return pd.DataFrame()
-
-    codes = pool["Code"].tolist()
-    factor_rows = []
-    progress    = st.progress(0, text="팩터 데이터 수집 중...")
-
-    for i, code in enumerate(codes):
-        progress.progress((i+1)/len(codes), text=f"팩터 계산 중... ({i+1}/{len(codes)})")
-        data = get_factor_data(code)
-        if data and data.get("price") and data["price"] > 0:
-            naver_row = pool[pool["Code"] == code]
-            if not naver_row.empty and not data.get("name"):
-                data["name"] = naver_row.iloc[0]["Name"]
-            factor_rows.append(data)
-        time.sleep(0.05)
-
-    progress.empty()
-
+def score_factors(factor_rows):
+    """팩터 점수화 - 순수 계산 함수 (UI 없음, 캐시 없음)"""
     if len(factor_rows) < 10:
         return pd.DataFrame()
 
@@ -579,28 +588,28 @@ def run_factor_screening(df_krx, market_filter="전체"):
     per_score = pd.Series(50.0, index=df.index)
     pbr_score = pd.Series(50.0, index=df.index)
     if per_valid.sum() > 5:
-        per_score[per_valid] = percentile_rank(df.loc[per_valid,"per"], ascending=False)
+        per_score[per_valid] = percentile_rank(df.loc[per_valid, "per"], ascending=False)
     if pbr_valid.sum() > 5:
-        pbr_score[pbr_valid] = percentile_rank(df.loc[pbr_valid,"pbr"], ascending=False)
+        pbr_score[pbr_valid] = percentile_rank(df.loc[pbr_valid, "pbr"], ascending=False)
     scores["value"] = (per_score + pbr_score) / 2
 
     mom_valid = df["momentum"].notna()
     scores["momentum"] = 50.0
     if mom_valid.sum() > 5:
-        scores.loc[mom_valid,"momentum"] = percentile_rank(df.loc[mom_valid,"momentum"], ascending=True)
+        scores.loc[mom_valid, "momentum"] = percentile_rank(df.loc[mom_valid, "momentum"], ascending=True)
 
     roe_valid = df["roe"].notna() & (df["roe"] > -100) & (df["roe"] < 200)
     scores["quality"] = 50.0
     if roe_valid.sum() > 5:
-        scores.loc[roe_valid,"quality"] = percentile_rank(df.loc[roe_valid,"roe"], ascending=True)
+        scores.loc[roe_valid, "quality"] = percentile_rank(df.loc[roe_valid, "roe"], ascending=True)
 
     vol_valid = df["volatility"].notna() & (df["volatility"] > 0)
     scores["volatility"] = 50.0
     if vol_valid.sum() > 5:
-        scores.loc[vol_valid,"volatility"] = percentile_rank(df.loc[vol_valid,"volatility"], ascending=False)
+        scores.loc[vol_valid, "volatility"] = percentile_rank(df.loc[vol_valid, "volatility"], ascending=False)
 
-    df["종합점수"]  = (scores["value"]*0.30 + scores["momentum"]*0.30 +
-                      scores["quality"]*0.25 + scores["volatility"]*0.15).round(1)
+    df["종합점수"]   = (scores["value"]*0.30 + scores["momentum"]*0.30 +
+                        scores["quality"]*0.25 + scores["volatility"]*0.15).round(1)
     df["밸류점수"]   = scores["value"].round(1)
     df["모멘텀점수"] = scores["momentum"].round(1)
     df["퀄리티점수"] = scores["quality"].round(1)
@@ -622,7 +631,7 @@ def run_factor_screening(df_krx, market_filter="전체"):
     return result.sort_values("종합점수", ascending=False).reset_index(drop=True)
 
 # ==========================================
-# 7. 유틸리티 함수
+# 7. 유틸리티
 # ==========================================
 
 @st.cache_data(ttl=60)
@@ -794,9 +803,11 @@ with st.sidebar:
         is_real = st.secrets.get("KIS_IS_REAL", False)
         st.success(f"✅ KIS API ({'실전' if is_real else '모의'}) 실시간 연동")
     else:
-        st.error("⚠️ KIS API 연결 실패\nKIS_APP_KEY / KIS_APP_SECRET 확인")
+        st.error("⚠️ KIS API 연결 실패")
 
-    model_choice = st.selectbox("AI 모델", ("gemini-2.5-flash","gemini-2.5-pro"))
+    # 🔥 실제 최신 Gemini 모델명
+    model_choice = st.selectbox("AI 모델", ("gemini-3.5-flash", "gemini-3.1-pro"))
+
     st.divider()
     webhook_url = st.text_input("Webhook URL", placeholder="https://...")
     if st.button("테스트 알림"):
@@ -835,9 +846,9 @@ tab_main, tab_search, tab_recommend, tab_backtest, tab_chat = st.tabs([
 # ── 탭1: 실시간 시장 랭킹 ──
 with tab_main:
     if df_krx.empty:
-        st.warning("⚠️ 실시간 랭킹 데이터를 가져오지 못했습니다. 잠시 후 새로고침 해주세요.")
+        st.warning("⚠️ 실시간 랭킹 데이터를 가져오지 못했습니다.")
     else:
-        st.caption(f"✅ 총 {len(df_krx)}개 종목 실시간 수집 완료 | 🔄 1분마다 자동 갱신")
+        st.caption(f"✅ 총 {len(df_krx)}개 종목 수집 완료 | 🔄 1분마다 자동 갱신")
         m_data = get_ranking_tables(df_krx)
         t1,t2,t3,t4,t5,t6 = st.tabs([
             "👑 KOSPI 시총","👑 KOSDAQ 시총",
@@ -918,12 +929,12 @@ with tab_recommend:
     st.markdown("""
     **4개 팩터 가중 합산으로 종목 점수화** (KIS 실시간 데이터 기반)
 
-    | 팩터 | 지표 | 가중치 | 의미 |
-    |---|---|---|---|
-    | 밸류 | PER, PBR | 30% | 저평가 종목 |
-    | 모멘텀 | 1M/3M/6M 수익률 | 30% | 추세 지속 종목 |
-    | 퀄리티 | ROE (EPS/BPS) | 25% | 수익성 우수 종목 |
-    | 저변동성 | 20일 수익률 표준편차 | 15% | 안정적 종목 |
+    | 팩터 | 지표 | 가중치 |
+    |---|---|---|
+    | 밸류 | PER, PBR | 30% |
+    | 모멘텀 | 1M/3M/6M 수익률 | 30% |
+    | 퀄리티 | ROE (EPS/BPS) | 25% |
+    | 저변동성 | 20일 수익률 표준편차 | 15% |
     """)
 
     col_a, col_b, col_c = st.columns(3)
@@ -939,8 +950,38 @@ with tab_recommend:
         elif not get_kis_token():
             st.error("KIS API 연결이 필요합니다.")
         else:
-            with st.spinner("시총 상위 200종목 팩터 분석 중... (약 1\~2분 소요)"):
-                result_df = run_factor_screening(df_krx, market_filter)
+            pool = df_krx.copy()
+            if market_filter != "전체":
+                pool = pool[pool["Market"] == market_filter]
+            pool = pool[pool["Marcap"] > 0].sort_values("Marcap", ascending=False).head(200)
+
+            st.info(f"📊 분석 대상: {len(pool)}개 종목 (시총 상위 기준)")
+
+            codes       = pool["Code"].tolist()
+            factor_rows = []
+            progress    = st.progress(0, text="팩터 데이터 수집 중...")
+
+            for i, code in enumerate(codes):
+                progress.progress(
+                    (i+1)/len(codes),
+                    text=f"팩터 계산 중... ({i+1}/{len(codes)}) - {code}"
+                )
+                data = get_factor_data(code)
+                if data and data.get("price") and data["price"] > 0:
+                    # 🔥 네이버 pool 종목명 항상 우선 적용
+                    naver_row = pool[pool["Code"] == code]
+                    if not naver_row.empty:
+                        data["name"] = naver_row.iloc[0]["Name"]
+                    elif not data.get("name") or data["name"] == code:
+                        _, found_name = search_naver_stock(code)
+                        if found_name:
+                            data["name"] = found_name
+                    factor_rows.append(data)
+                time.sleep(0.05)
+
+            progress.empty()
+
+            result_df = score_factors(factor_rows)
 
             if result_df.empty:
                 st.error("팩터 데이터 수집 실패. 잠시 후 다시 시도해주세요.")
@@ -948,7 +989,6 @@ with tab_recommend:
                 top_df = result_df.head(top_n)
                 st.success(f"✅ 스크리닝 완료 | 분석 종목: {len(result_df)}개 | 상위 {top_n}종목")
 
-                # 상위 5종목 카드
                 cols = st.columns(min(5, top_n))
                 for idx, row in top_df.head(5).iterrows():
                     with cols[idx]:
@@ -959,15 +999,14 @@ with tab_recommend:
                             value=f"₩{int(row['현재가']):,}" if pd.notna(row["현재가"]) else "N/A",
                             delta=f"종합 {score}점"
                         )
-                        if pd.notna(row["PER"]) and pd.notna(row["PBR"]):
+                        if pd.notna(row.get("PER")) and pd.notna(row.get("PBR")):
                             st.caption(
-                                f"PER: {row['PER']:.1f} | PBR: {row['PBR']:.1f}\n"
-                                f"ROE: {row['ROE(%)']:.1f}% | 모멘텀: {row['6M수익률(%)']:.1f}%"
+                                f"PER: {row['PER']:.1f} | PBR: {row['PBR']:.1f} | "
+                                f"ROE: {row['ROE(%)']:.1f}%"
                             )
 
                 st.divider()
 
-                # 팩터 스코어 전체 테이블
                 st.subheader(f"📊 팩터 스코어 상위 {top_n}종목")
                 st.dataframe(
                     top_df.style.background_gradient(
@@ -978,11 +1017,12 @@ with tab_recommend:
                     hide_index=True
                 )
 
-                # AI 해설
                 st.subheader("🧠 AI 팩터 분석 해설")
-                top5_summary = top_df.head(5)[["종목명","PER","PBR","ROE(%)","6M수익률(%)","종합점수"]].to_dict("records")
+                top5_summary = top_df.head(5)[
+                    ["종목명","PER","PBR","ROE(%)","6M수익률(%)","종합점수"]
+                ].to_dict("records")
                 ai_comment, _ = get_ai_response(
-                    f"퀀트 팩터 스크리닝 결과 상위 5종목:\n{json.dumps(top5_summary,ensure_ascii=False)}\n\n각 종목의 팩터 특징과 투자 포인트를 간결하게 설명하라. 단, 투자 권유가 아닌 데이터 기반 팩터 분석임을 명시하라.",
+                    f"퀀트 팩터 스크리닝 결과 상위 5종목:\n{json.dumps(top5_summary,ensure_ascii=False)}\n\n각 종목의 팩터 특징과 투자 포인트를 간결하게 설명하라. 투자 권유가 아닌 데이터 기반 팩터 분석임을 명시하라.",
                     api_key, model_choice,
                     "당신은 퀀트 애널리스트입니다. 마크다운으로 작성하세요.",
                     is_json=False

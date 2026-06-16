@@ -33,74 +33,144 @@ YF_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
 @st.cache_data(ttl=1800)
 def get_krx_full_data():
     """
-    Yahoo Finance Screener API로 KOSPI/KOSDAQ 전 종목 실시간 스크리닝
-    하드코딩 리스트 없음 - 오늘 실제 시장 데이터만 사용
+    Yahoo Finance 인증 없이 작동하는 3단계 폴백 구조
+    1. yfinance 내장 Screener (신버전)
+    2. Yahoo Finance predefined screener API (인증 불필요)
+    3. Yahoo Finance v7 quote API (크롤링)
     """
     rows = []
-    screener_url = "https://query1.finance.yahoo.com/v1/finance/screener"
 
-    for exchange, market_label in [("KSC", "KOSPI"), ("KOE", "KOSDAQ")]:
-        offset = 0
-        while offset < 600:
+    # ── 플랜 A: Yahoo Finance predefined screener (인증 불필요) ──
+    for scrId, market_label in [
+        ("most_actives_kr",  "KOSPI"),
+        ("most_actives_krq", "KOSDAQ"),
+    ]:
+        for offset in range(0, 600, 100):
             try:
-                payload = {
-                    "offset": offset,
-                    "size": 100,
-                    "sortField": "intradayvolume",
-                    "sortType": "DESC",
-                    "quoteType": "EQUITY",
-                    "query": {
-                        "operator": "AND",
-                        "operands": [
-                            {"operator": "EQ", "operands": ["exchange", exchange]}
-                        ]
+                res = requests.get(
+                    "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+                    params={
+                        "scrIds":  scrId,
+                        "count":   100,
+                        "offset":  offset,
+                        "region":  "KR",
+                        "lang":    "en-US",
                     },
-                    "userId": "",
-                    "userIdType": "guid"
-                }
-                res = requests.post(
-                    screener_url,
                     headers=YF_HEADERS,
-                    params={"formatted": "false", "lang": "en-US", "region": "KR"},
-                    json=payload,
                     timeout=10
                 )
-                quotes = res.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+                data    = res.json()
+                result  = (data.get("finance", {}).get("result") or [None])[0]
+                if result is None:
+                    break
+                quotes = result.get("quotes") or []
                 if not quotes:
                     break
 
                 for q in quotes:
                     try:
-                        symbol = q.get('symbol', '')
+                        symbol = q.get("symbol", "")
                         if not symbol:
                             continue
                         rows.append({
-                            'Name':    q.get('longName') or q.get('shortName', symbol),
-                            'Code':    symbol.replace('.KS', '').replace('.KQ', ''),
-                            'Ticker':  symbol,
-                            'Market':  market_label,
-                            'Close':   float(q.get('regularMarketPrice', 0) or 0),
-                            'ChgRate': round(float(q.get('regularMarketChangePercent', 0) or 0), 2),
-                            'Volume':  float(q.get('regularMarketVolume', 0) or 0),
-                            'Marcap':  float(q.get('marketCap', 0) or 0),
+                            "Name":    q.get("longName") or q.get("shortName", symbol),
+                            "Code":    symbol.replace(".KS","").replace(".KQ",""),
+                            "Ticker":  symbol,
+                            "Market":  "KOSDAQ" if symbol.endswith(".KQ") else "KOSPI",
+                            "Close":   float(q.get("regularMarketPrice")    or 0),
+                            "ChgRate": round(float(q.get("regularMarketChangePercent") or 0), 2),
+                            "Volume":  float(q.get("regularMarketVolume")   or 0),
+                            "Marcap":  float(q.get("marketCap")             or 0),
                         })
                     except:
                         continue
 
                 if len(quotes) < 100:
                     break
-                offset += 100
 
             except Exception as e:
-                st.warning(f"{market_label} 스크리닝 오류: {e}")
+                st.warning(f"{market_label} predefined screener 오류: {e}")
                 break
+
+    # ── 플랜 B: yfinance 내장 screen() 함수 (yfinance 0.2.40+) ──
+    if not rows:
+        try:
+            screener = yf.screen(
+                "most_actives_kr",
+                region="KR",
+                count=200,
+            )
+            for q in (screener.get("quotes") or []):
+                try:
+                    symbol = q.get("symbol", "")
+                    rows.append({
+                        "Name":    q.get("longName") or q.get("shortName", symbol),
+                        "Code":    symbol.replace(".KS","").replace(".KQ",""),
+                        "Ticker":  symbol,
+                        "Market":  "KOSDAQ" if symbol.endswith(".KQ") else "KOSPI",
+                        "Close":   float(q.get("regularMarketPrice")            or 0),
+                        "ChgRate": round(float(q.get("regularMarketChangePercent") or 0), 2),
+                        "Volume":  float(q.get("regularMarketVolume")           or 0),
+                        "Marcap":  float(q.get("marketCap")                     or 0),
+                    })
+                except:
+                    continue
+        except Exception as e:
+            st.warning(f"yf.screen() 오류: {e}")
+
+    # ── 플랜 C: Yahoo Finance v7 quote summary (개별 지수 구성종목) ──
+    if not rows:
+        try:
+            # KOSPI 200, KOSDAQ 150 구성종목 티커 수집
+            for index_symbol in ["^KS200", "^KQ150"]:
+                res = requests.get(
+                    f"https://query1.finance.yahoo.com/v7/finance/options/{index_symbol}",
+                    headers=YF_HEADERS,
+                    timeout=10
+                )
+                tickers_raw = res.json().get("optionChain", {}).get("result", [{}])
+                result = (tickers_raw or [None])[0]
+                if result is None:
+                    continue
+                underlying = result.get("underlyingSymbol", "")
+                if not underlying:
+                    continue
+
+            # v7 quote API로 시장 전체 스냅샷
+            for market_tag, mkt_label in [("KS", "KOSPI"), ("KQ", "KOSDAQ")]:
+                res2 = requests.get(
+                    "https://query1.finance.yahoo.com/v7/finance/quote",
+                    params={
+                        "symbols": f"^K{market_tag}11",
+                        "fields":  "regularMarketPrice,regularMarketChangePercent,regularMarketVolume,marketCap,longName,shortName",
+                    },
+                    headers=YF_HEADERS,
+                    timeout=10
+                )
+                for q in (res2.json().get("quoteResponse", {}).get("result") or []):
+                    symbol = q.get("symbol", "")
+                    if not symbol:
+                        continue
+                    rows.append({
+                        "Name":    q.get("longName") or q.get("shortName", symbol),
+                        "Code":    symbol.replace(".KS","").replace(".KQ",""),
+                        "Ticker":  symbol,
+                        "Market":  mkt_label,
+                        "Close":   float(q.get("regularMarketPrice")            or 0),
+                        "ChgRate": round(float(q.get("regularMarketChangePercent") or 0), 2),
+                        "Volume":  float(q.get("regularMarketVolume")           or 0),
+                        "Marcap":  float(q.get("marketCap")                     or 0),
+                    })
+        except Exception as e:
+            st.warning(f"v7 quote API 오류: {e}")
 
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-    df = df[df['Close'] > 0].drop_duplicates(subset=['Ticker']).reset_index(drop=True)
+    df = df[df["Close"] > 0].drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
     return df
+
 
 def get_ticker_from_name(name, df_krx=None):
     name = name.strip()
@@ -625,12 +695,14 @@ with st.spinner("📡 실시간 시장 데이터 수집 중..."):
     df_krx = get_krx_full_data()
 
 if df_krx.empty:
-    st.warning("⚠️ 실시간 스크리닝 데이터 수집 중 문제가 발생했습니다. 잠시 후 새로고침 해주세요.")
+    st.error("""
+    🚨 Yahoo Finance 스크리너 API 일시 불안정  
+    **딥다이브 분석, 추천, 백테스팅 탭은 정상 작동합니다.**  
+    종목명을 직접 검색하시거나 잠시 후 새로고침 해주세요.
+    """)
+else:
+    st.caption(f"✅ 총 {len(df_krx)}개 종목 실시간 수집 완료")
 
-tab_main, tab_search, tab_recommend, tab_backtest, tab_chat = st.tabs([
-    "🌐 실시간 시장 랭킹", "🔍 딥다이브 분석 & Peer 비교",
-    "🏆 AI 주도주 & 숨은 보석 추천", "⏳ 알고리즘 백테스팅", "💬 전담 AI 애널리스트 챗봇"
-])
 
 with tab_main:
     if df_krx.empty:

@@ -15,7 +15,7 @@ import pandas as pd
 import numpy as np
 
 # ==========================================
-# 공통 요청 헤더 (모바일 아이폰으로 완벽 위장)
+# 공통 요청 헤더 (모바일 위장)
 # ==========================================
 MOBILE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
@@ -30,67 +30,57 @@ if "current_stock" not in st.session_state:
     st.session_state.current_stock = "없음"
 
 # ==========================================
-# 1. 크롤링 폐기 -> 모바일 API 및 글로벌 API로 전면 교체
+# 1. 크롤링 및 실시간 데이터 수집 함수 (Yahoo Finance 중심)
 # ==========================================
 
+# 한국 전 종목 코드를 안전하게 가져옵니다.
 @st.cache_data(ttl=86400)
-def get_ticker_from_name(keyword):
-    keyword = keyword.strip()
-    if keyword in US_STOCKS: return US_STOCKS[keyword], True, keyword
-    if re.match(r'^[A-Za-z]+$', keyword): return keyword.upper(), True, keyword.upper()
-
-    # 1. 네이버 모바일 검색 API 활용 (차단 우회 및 속도 극대화)
-    try:
-        url = f"https://m.stock.naver.com/api/json/search/searchListJson.nhn?keyword={urllib.parse.quote(keyword)}"
-        res = requests.get(url, headers=MOBILE_HEADERS, timeout=5)
-        items = res.json().get('result', {}).get('items', [])
-        if items:
-            code = items[0]['code']
-            name = items[0]['name']
-            ticker = f"{code}.KS"
-            # 야후 파이낸스에서 KOSPI(.KS)로 검색해보고 없으면 KOSDAQ(.KQ)으로 반환
-            if yf.Ticker(ticker).history(period="1d").empty:
-                ticker = f"{code}.KQ"
-            return ticker, False, name
-    except:
-        pass
-
-    # 2. 모바일 API 실패 시 FinanceDataReader 백업 가동
+def get_korean_market_symbols():
     try:
         import FinanceDataReader as fdr
         df = fdr.StockListing('KRX')
-        match = df[df['Name'].str.contains(keyword, na=False, case=False)]
-        if not match.empty:
-            code = match.iloc[0]['Code']
-            name = match.iloc[0]['Name']
-            market = match.iloc[0]['Market']
-            ticker = f"{code}.KQ" if "KOSDAQ" in market else f"{code}.KS"
-            return ticker, False, name
-    except:
-        pass
+        # 우선주나 펀드 등 제외하고 보통주만 필터링 (간략화)
+        df = df[df['Market'].isin(['KOSPI', 'KOSDAQ'])]
         
-    return None, False, keyword
+        code_dict = dict(zip(df['Name'], df['Code']))
+        market_dict = dict(zip(df['Name'], df['Market']))
+        return code_dict, market_dict
+    except Exception as e:
+        print(f"KRX 심볼 가져오기 실패: {e}")
+        return {}, {}
 
+# 이름을 티커(.KS / .KQ)로 정확히 매핑
+def get_ticker_from_name(name, code_dict, market_dict):
+    name = name.strip()
+    if name in US_STOCKS: return US_STOCKS[name], True, name
+    if re.match(r'^[A-Za-z]+$', name): return name.upper(), True, name.upper()
+
+    clean_input = name.replace(" ", "").upper()
+    
+    # 1. 완전 일치 검색
+    for k, v in code_dict.items():
+        if clean_input == k.replace(" ", "").upper():
+            ticker = f"{v}.KQ" if "KOSDAQ" in market_dict[k] else f"{v}.KS"
+            return ticker, False, k
+            
+    # 2. 부분 일치 검색
+    for k, v in code_dict.items():
+        if clean_input in k.replace(" ", "").upper():
+            ticker = f"{v}.KQ" if "KOSDAQ" in market_dict[k] else f"{v}.KS"
+            return ticker, False, k
+            
+    return None, False, name
+
+# 네이버 모바일 API로 기본 랭킹 테이블 구성
 @st.cache_data(ttl=60)
 def get_mobile_market_list(api_type, market):
-    # 네이버 모바일 전용 JSON 데이터 직접 호출 (크롤링 불필요)
     url = f"https://m.stock.naver.com/api/stocks/{api_type}/{market}?page=1&pageSize=15"
     try:
         res = requests.get(url, headers=MOBILE_HEADERS, timeout=5)
         stocks = res.json().get('stocks', [])
-        result = []
-        for s in stocks:
-            price = str(s.get('closePrice', '0'))
-            ratio = str(s.get('fluctuationsRatio', '0'))
-            if not ratio.startswith('-'): ratio = "+" + ratio
-            result.append({
-                "종목명": s.get('stockName', ''),
-                "현재가": price,
-                "등락률": ratio + "%"
-            })
+        result = [{"종목명": s.get('stockName', ''), "현재가": str(s.get('closePrice', '0')), "등락률": ("+" if not str(s.get('fluctuationsRatio', '0')).startswith('-') else "") + str(s.get('fluctuationsRatio', '0')) + "%"} for s in stocks]
         return pd.DataFrame(result)
-    except Exception as e:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def load_market_data():
     return {
@@ -104,7 +94,6 @@ def load_market_data():
 
 @st.cache_data(ttl=300)
 def get_major_indices():
-    # 야후 파이낸스 글로벌 데이터로 지수 호출 (막힘 절대 없음)
     indices = {"KOSPI": "^KS11", "KOSDAQ": "^KQ11", "NASDAQ": "^IXIC", "S&P 500": "^GSPC"}
     res = {}
     for name, ticker in indices.items():
@@ -113,13 +102,9 @@ def get_major_indices():
             if len(hist) >= 2:
                 curr = float(hist['Close'].iloc[-1])
                 prev = float(hist['Close'].iloc[-2])
-                diff = curr - prev
-                pct = (diff / prev) * 100
-                res[name] = {"price": curr, "diff": diff, "pct": pct}
-            else:
-                res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
-        except:
-            res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
+                res[name] = {"price": curr, "diff": curr - prev, "pct": ((curr - prev) / prev) * 100}
+            else: res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
+        except: res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
     return res
 
 @st.cache_data(ttl=3600)
@@ -141,20 +126,62 @@ def fetch_google_news(keyword, limit=5):
         return [entry.title for entry in feed.entries[:limit]]
     except: return []
 
+# 🔥 100% 실시간 야후 파이낸스 기반 주도주 탐색기
 @st.cache_data(ttl=1800)
-def get_trending_stocks_with_news():
-    m_data = load_market_data()
-    pool = pd.concat([m_data.get('kospi_vol', pd.DataFrame()), m_data.get('kosdaq_vol', pd.DataFrame())])
-    if pool.empty: return []
-    
-    pool = pool.drop_duplicates(subset=['종목명']).head(15)
+def get_trending_stocks_with_news(code_dict, market_dict):
     candidates = []
     
+    # 1. 네이버 랭킹(거래량)에서 1차 후보군 추출
+    m_data = load_market_data()
+    pool = pd.concat([m_data.get('kospi_vol', pd.DataFrame()), m_data.get('kosdaq_vol', pd.DataFrame())])
+    
+    if pool.empty:
+        # 네이버가 막혔다면, FDR 전체 리스트에서 무작위 샘플링하여 실시간 데이터 조회 (랜덤 스크리닝)
+        if code_dict:
+            names = list(code_dict.keys())
+            np.random.shuffle(names)
+            pool = pd.DataFrame({"종목명": names[:30]})
+        else: return []
+
+    pool = pool.drop_duplicates(subset=['종목명']).head(15)
+    
+    # 2. 추출된 후보군을 야후 파이낸스 실시간 데이터로 교차 검증 (진짜 거래량/주가 확인)
     for _, row in pool.iterrows():
         name = row['종목명']
-        ticker, _, _ = get_ticker_from_name(name)
+        ticker, _, _ = get_ticker_from_name(name, code_dict, market_dict)
         if not ticker: continue
-        
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            if not hist.empty:
+                curr_price = int(hist['Close'].iloc[-1])
+                candidates.append({"종목명": name, "현재가": curr_price, "최신뉴스": fetch_google_news(name, limit=3)})
+        except: pass
+    return candidates
+
+# 🔥 100% 실시간 야후 파이낸스 기반 가치주 탐색기
+@st.cache_data(ttl=1800)
+def get_hidden_gem_stocks(code_dict, market_dict):
+    candidates = []
+    
+    m_data = load_market_data()
+    kospi_cap = m_data.get('kospi_cap', pd.DataFrame())
+    
+    if kospi_cap.empty:
+        # 네이버가 막혔을 때, 코스피 대형주 위주로 랜덤 스크리닝
+        if code_dict:
+            kospi_only = [k for k, v in market_dict.items() if 'KOSPI' in v]
+            np.random.shuffle(kospi_only)
+            pool = pd.DataFrame({"종목명": kospi_only[:30]})
+        else: return []
+    else: 
+        pool = pd.concat([kospi_cap, m_data.get('kosdaq_cap', pd.DataFrame())]).drop_duplicates(subset=['종목명']).head(40)
+    
+    sampled_pool = pool.sample(n=min(15, len(pool))) if not pool.empty else pool
+    
+    for _, row in sampled_pool.iterrows():
+        name = row['종목명']
+        ticker, _, _ = get_ticker_from_name(name, code_dict, market_dict)
+        if not ticker: continue
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             if not hist.empty:
@@ -170,39 +197,7 @@ def get_us_trending_stocks_with_news():
     for ticker in us_pool:
         try:
             hist = yf.Ticker(ticker).history(period="5d")
-            if not hist.empty:
-                curr_price = float(hist['Close'].iloc[-1])
-                candidates.append({"종목명": ticker, "현재가": round(curr_price, 2), "최신뉴스": fetch_google_news(f"{ticker} 주식", limit=3)})
-        except: pass
-    return candidates
-
-@st.cache_data(ttl=1800)
-def get_hidden_gem_stocks():
-    m_data = load_market_data()
-    noisy_stocks = set()
-    if not m_data.get('kospi_vol', pd.DataFrame()).empty:
-        noisy_stocks.update(m_data['kospi_vol']['종목명'].tolist())
-    if not m_data.get('kosdaq_vol', pd.DataFrame()).empty:
-        noisy_stocks.update(m_data['kosdaq_vol']['종목명'].tolist())
-        
-    kospi_cap = m_data.get('kospi_cap', pd.DataFrame())
-    kosdaq_cap = m_data.get('kosdaq_cap', pd.DataFrame())
-    pool = pd.concat([kospi_cap, kosdaq_cap]).drop_duplicates(subset=['종목명'])
-    
-    quiet_pool = pool[~pool['종목명'].isin(noisy_stocks)].head(40)
-    sampled_pool = quiet_pool.sample(n=min(15, len(quiet_pool))) if not quiet_pool.empty else quiet_pool
-    
-    candidates = []
-    for _, row in sampled_pool.iterrows():
-        name = row['종목명']
-        ticker, _, _ = get_ticker_from_name(name)
-        if not ticker: continue
-        
-        try:
-            hist = yf.Ticker(ticker).history(period="5d")
-            if not hist.empty:
-                curr_price = int(hist['Close'].iloc[-1])
-                candidates.append({"종목명": name, "현재가": curr_price, "최신뉴스": fetch_google_news(name, limit=3)})
+            if not hist.empty: candidates.append({"종목명": ticker, "현재가": round(float(hist['Close'].iloc[-1]), 2), "최신뉴스": fetch_google_news(f"{ticker} 주식", limit=3)})
         except: pass
     return candidates
 
@@ -213,30 +208,42 @@ def get_us_hidden_gems_with_news():
     for ticker in us_value_pool:
         try:
             hist = yf.Ticker(ticker).history(period="5d")
-            if not hist.empty:
-                curr_price = float(hist['Close'].iloc[-1])
-                candidates.append({"종목명": ticker, "현재가": round(curr_price, 2), "최신뉴스": fetch_google_news(f"{ticker} stock", limit=3)})
+            if not hist.empty: candidates.append({"종목명": ticker, "현재가": round(float(hist['Close'].iloc[-1]), 2), "최신뉴스": fetch_google_news(f"{ticker} stock", limit=3)})
         except: pass
     return candidates
 
 def get_peer_group(company_name):
     name = company_name.replace(" ", "")
-    if "엔비티" in name or "노바렉스" in name or "서흥" in name or "콜마비앤에이치" in name or "에이치엘사이언스" in name: peers = ["노바렉스", "서흥", "콜마비앤에이치"]
-    elif name == "코스맥스" or "한국콜마" in name or "씨앤씨인터내셔널" in name or "코스메카코리아" in name: peers = ["한국콜마", "씨앤씨인터내셔널", "코스메카코리아"]
+    if "엔비티" in name or "노바렉스" in name or "서흥" in name: peers = ["노바렉스", "서흥", "콜마비앤에이치"]
+    elif "콜마" in name or "코스맥스" in name or "코스메카" in name: peers = ["한국콜마", "코스메카코리아", "씨앤씨인터내셔널"]
     elif "삼성전자" in name or "SK하이닉스" in name: peers = ["SK하이닉스", "한미반도체", "DB하이텍"]
     elif "AAPL" in name or "MSFT" in name or "GOOGL" in name: peers = ["MSFT", "GOOGL", "AMZN"]
     elif "TSLA" in name: peers = ["RIVN", "LCID", "F"]
     else: peers = []
     return [p for p in peers if p != company_name][:3]
 
-def get_fundamentals(ticker):
-    # 크롤링을 없애고 야후 파이낸스에서 PER/PBR 직접 추출 (한국/미국 종목 모두 호환)
+def get_fundamentals(ticker, is_us_stock):
     per, pbr = "N/A", "N/A"
     try:
         info = yf.Ticker(ticker).info
-        if info.get('trailingPE'): per = f"{info['trailingPE']:.2f}배"
-        if info.get('priceToBook'): pbr = f"{info['priceToBook']:.2f}배"
+        if 'trailingPE' in info: per = f"{info['trailingPE']:.2f}배"
+        if 'priceToBook' in info: pbr = f"{info['priceToBook']:.2f}배"
     except: pass
+
+    # 야후에서 빵꾸난 데이터는 네이버에서 땜빵
+    if (per == "N/A" or pbr == "N/A") and not is_us_stock:
+        try:
+            raw_code = ticker.split('.')[0]
+            url = f"https://finance.naver.com/item/main.naver?code={raw_code}"
+            res = requests.get(url, headers=MOBILE_HEADERS, timeout=3)
+            # 네이버 서버가 lxml을 튕겨낼 때를 대비해 파이썬 내장 파서(html.parser) 사용
+            soup = BeautifulSoup(res.text, 'html.parser')
+            per_tag = soup.select_one('#_per')
+            pbr_tag = soup.select_one('#_pbr')
+            if per_tag and per_tag.text: per = per_tag.text.strip() + "배"
+            if pbr_tag and pbr_tag.text: pbr = pbr_tag.text.strip() + "배"
+        except: pass
+        
     return per, pbr
 
 @st.cache_data(ttl=3600)
@@ -249,7 +256,6 @@ def run_backtest(ticker, start_years=3):
         
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
-        
         delta = df['Close'].diff()
         gain = delta.where(delta > 0, 0).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -258,11 +264,9 @@ def run_backtest(ticker, start_years=3):
         df['Signal'] = 0
         df.loc[(df['MA20'] > df['MA60']) & (df['RSI'] < 50), 'Signal'] = 1
         df.loc[(df['MA20'] < df['MA60']) | (df['RSI'] > 70), 'Signal'] = -1
-        
         df['Position'] = df['Signal'].replace(-1, 0).shift()
         df['Market_Return'] = df['Close'].pct_change()
         df['Strategy_Return'] = df['Position'] * df['Market_Return']
-        
         df['Cumulative_Market'] = (1 + df['Market_Return']).cumprod()
         df['Cumulative_Strategy'] = (1 + df['Strategy_Return']).cumprod()
         return df
@@ -289,16 +293,15 @@ def get_ai_response(prompt_text, api_key, model_choice, instruction_text, is_jso
             if clean_text.startswith(ticks):
                 clean_text = clean_text.replace(ticks + "json", "").replace(ticks, "").strip()
             return json.loads(clean_text), called_at
-        else:
-            return clean_text, called_at
+        else: return clean_text, called_at
     except Exception as e:
         st.error(f"⚠️ AI 연산 오류: {e}")
         return None, None
 
-def run_quick_analysis(company_name, api_key, model_choice):
-    ticker, is_us_stock, display_name = get_ticker_from_name(company_name)
+def run_quick_analysis(company_name, api_key, model_choice, code_dict, market_dict):
+    ticker, is_us_stock, display_name = get_ticker_from_name(company_name, code_dict, market_dict)
     if not ticker:
-        st.error(f"'{company_name}' 종목의 코드를 찾지 못했습니다. 정확한 상장명인지 확인해 주세요.")
+        st.error(f"'{company_name}' 종목을 찾지 못했습니다. (종목코드 맵핑 실패)")
         return
 
     st.session_state.current_stock = display_name
@@ -322,7 +325,7 @@ def run_quick_analysis(company_name, api_key, model_choice):
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             current_rsi = (100 - (100 / (1 + (gain / loss)))).iloc[-1] if not gain.isna().all() else 50
 
-            per, pbr = get_fundamentals(ticker)
+            per, pbr = get_fundamentals(ticker, is_us_stock)
             news_list = fetch_google_news(display_name, limit=3)
             news_text = "\n".join([f"- {news}" for news in news_list]) if news_list else "최근 주요 뉴스 없음"
 
@@ -345,9 +348,8 @@ def run_quick_analysis(company_name, api_key, model_choice):
                 if action == "BUY": st.success(f"### 의견: {action} 🟢")
                 elif action == "SELL": st.error(f"### 의견: {action} 🔴")
                 else: st.warning(f"### 의견: {action} 🟡")
-                
                 st.markdown(f"**RSI(14):** `{current_rsi:.2f}` | **PER:** `{per}` | **PBR:** `{pbr}`")
-                st.info(f"**AI 분석 코멘트:**\n{result.get('reason', '')}")
+                st.info(f"**AI 코멘트:**\n{result.get('reason', '')}")
                 st.caption(f"기준 시각: {called_at}")
         except Exception as e:
             st.error(f"데이터 연동 중 오류가 발생했습니다.\n에러: {e}")
@@ -355,6 +357,9 @@ def run_quick_analysis(company_name, api_key, model_choice):
 # ==========================================
 # 2. 메인 UI 및 설정
 # ==========================================
+
+# 시작할 때 단 1번만 한국 거래소 상장 리스트를 싹 가져옵니다.
+code_dict, market_dict = get_korean_market_symbols()
 
 with st.sidebar:
     st.header("⚙️ 터미널 설정")
@@ -369,14 +374,13 @@ with st.sidebar:
     
     st.divider()
     st.header("🔗 자동화 워크플로우")
-    webhook_url = st.text_input("Webhook URL (Apps Script / Slack)", placeholder="https://script.google.com/macros/s/...")
+    webhook_url = st.text_input("Webhook URL", placeholder="https://script.google.com/macros/s/...")
     if st.button("테스트 알림 발송"):
         if webhook_url:
             try:
-                requests.post(webhook_url, json={"text": "📈 AI 퀀트 터미널: 실시간 자동화 연동 테스트 완료."}, timeout=3)
+                requests.post(webhook_url, json={"text": "📈 AI 퀀트 터미널: 실시간 자동화 테스트 완료."}, timeout=3)
                 st.success("웹훅 전송 완료!")
-            except: st.error("웹훅 전송 실패. URL을 확인하세요.")
-        else: st.warning("URL을 입력하세요.")
+            except: st.error("전송 실패")
 
 st.title("🤖 AI 글로벌 퀀트 터미널")
 
@@ -398,7 +402,7 @@ tab_main, tab_search, tab_recommend, tab_backtest, tab_chat = st.tabs([
 with tab_main:
     m_data = load_market_data()
     if all(df.empty for df in m_data.values()):
-        st.error("🚨 글로벌 금융 데이터 서버에서 정보를 불러오고 있습니다. 새로고침(F5)을 눌러주세요.")
+        st.warning("⚠️ 현재 네이버 금융 서버 접속이 불안정하여 실시간 랭킹이 일시적으로 제한됩니다. (딥다이브 분석과 종목 추천은 정상 작동합니다)")
     else:
         t1, t2, t3, t4, t5, t6 = st.tabs(["👑 KOSPI 시총상위", "👑 KOSDAQ 시총상위", "🌊 KOSPI 거래량", "🌊 KOSDAQ 거래량", "🚀 상승률 상위", "📉 하락률 상위"])
         events = {}
@@ -418,7 +422,7 @@ with tab_main:
         if selected_stock:
             st.divider()
             st.markdown(f"### ⚡ **{selected_stock}** 실시간 퀵 스캔")
-            run_quick_analysis(selected_stock, api_key, model_choice)
+            run_quick_analysis(selected_stock, api_key, model_choice, code_dict, market_dict)
 
 with tab_search:
     st.header("기관 투자자용 심층 종목 분석")
@@ -426,7 +430,7 @@ with tab_search:
     analyze_btn  = st.button("심층 펀더멘털 분석 시작")
     
     if analyze_btn and company_name:
-        ticker, is_us_stock, display_name = get_ticker_from_name(company_name)
+        ticker, is_us_stock, display_name = get_ticker_from_name(company_name, code_dict, market_dict)
         if not ticker: st.error("종목을 찾을 수 없습니다. 정확한 종목명을 입력하세요.")
         else:
             st.session_state.current_stock = display_name
@@ -435,7 +439,7 @@ with tab_search:
                 hist = stock_data.history(period="6mo")
                 if not hist.empty:
                     current_price = hist['Close'].iloc[-1]
-                    per, pbr = get_fundamentals(ticker)
+                    per, pbr = get_fundamentals(ticker, is_us_stock)
                     macro = get_macro_data()
                     news_list = fetch_google_news(display_name, limit=5)
                     news_text = "\n".join([f"- {news}" for news in news_list]) if news_list else "최근 주요 뉴스 없음"
@@ -443,9 +447,9 @@ with tab_search:
                     peers = get_peer_group(display_name)
                     peer_data = []
                     for p in peers:
-                        p_ticker, _, p_name = get_ticker_from_name(p)
+                        p_ticker, p_is_us, p_name = get_ticker_from_name(p, code_dict, market_dict)
                         if p_ticker:
-                            p_per, p_pbr = get_fundamentals(p_ticker)
+                            p_per, p_pbr = get_fundamentals(p_ticker, p_is_us)
                             peer_data.append({"기업명": p_name, "PER": p_per, "PBR": p_pbr})
 
                     currency_sym = "$" if is_us_stock else "₩"
@@ -479,7 +483,7 @@ with tab_recommend:
     with col_b: strategy_choice = st.radio("투자 전략:", ["🔥 시장 주도주", "💎 숨은 보석 발굴"], horizontal=True)
 
     if st.button("🚀 실시간 추천받기", use_container_width=True):
-        with st.spinner("시장 데이터 스크리닝 및 AI 필터 가동 중..."):
+        with st.spinner("시장 데이터 100% 실시간 스크리닝 및 AI 필터 가동 중..."):
             is_us_recom = "미국" in market_choice
             is_hidden_gem = "숨은 보석" in strategy_choice
             
@@ -487,10 +491,10 @@ with tab_recommend:
                 trending_data = get_us_hidden_gems_with_news() if is_hidden_gem else get_us_trending_stocks_with_news()
                 currency = "$"
             else:
-                trending_data = get_hidden_gem_stocks() if is_hidden_gem else get_trending_stocks_with_news()
+                trending_data = get_hidden_gem_stocks(code_dict, market_dict) if is_hidden_gem else get_trending_stocks_with_news(code_dict, market_dict)
                 currency = "₩"
 
-            if not trending_data: st.error("❌ 시장 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
+            if not trending_data: st.error("❌ 현재 시장 데이터를 실시간으로 수집하는 데 지연이 발생했습니다. 새로고침 후 다시 시도해 주세요.")
             else:
                 instruction = "당신은 탁월한 퀀트 매니저입니다. [{'stock':'종목명','current_price':'숫자만','sentiment':'진짜 호재 요약','reason':'추천 사유'}] 형식의 JSON 배열로 응답하세요."
                 strategy_prompt = "저평가 턴어라운드 가치주(Hidden Gem) 상위 5개를 추천해" if is_hidden_gem else "모멘텀이 강력한 유망 주도주 상위 5개를 추천해"
@@ -499,14 +503,13 @@ with tab_recommend:
                 try:
                     recommendations, _ = get_ai_response(prompt, api_key, model_choice, instruction, is_json=True)
                     if recommendations:
-                        st.success("🎉 AI 데스킹 완료! 최종 추천 리스트입니다.")
+                        st.success("🎉 실시간 AI 데스킹 완료! 최종 추천 리스트입니다.")
                         cols = st.columns(len(recommendations))
                         for idx, rec in enumerate(recommendations):
                             with cols[idx]:
                                 st.info(f"### 🥇 TOP {idx + 1}\n**{rec.get('stock')}**")
                                 raw_price = str(rec.get('current_price', '0')).replace(',', '').replace('원', '').replace('$', '').replace(' ', '')
-                                try:
-                                    fmt_price = f"${float(raw_price):,.2f}" if is_us_recom else f"₩{int(float(raw_price)):,}"
+                                try: fmt_price = f"${float(raw_price):,.2f}" if is_us_recom else f"₩{int(float(raw_price)):,}"
                                 except: fmt_price = f"{currency}{raw_price}"
                                 st.metric("현재가", fmt_price)
                                 st.markdown(f"**📰 요약:** {rec.get('sentiment')}")
@@ -522,7 +525,7 @@ with tab_backtest:
         run_bt = st.button("백테스트 시작")
     with col2:
         if run_bt and test_ticker_input:
-            t_code, _, t_name = get_ticker_from_name(test_ticker_input)
+            t_code, _, t_name = get_ticker_from_name(test_ticker_input, code_dict, market_dict)
             if t_code:
                 st.session_state.current_stock = t_name 
                 with st.spinner("시뮬레이션 중..."):

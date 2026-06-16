@@ -77,7 +77,7 @@ def kis_headers(tr_id, token):
 
 @st.cache_data(ttl=60)
 def get_kis_price(code):
-    """KIS 실시간 현재가"""
+    """KIS 실시간 현재가 + PER/PBR 포함"""
     token = get_kis_token()
     if not token:
         return None
@@ -98,6 +98,10 @@ def get_kis_price(code):
             "high":     int(str(d.get("stck_hgpr",  "0")).replace(",", "")),
             "low":      int(str(d.get("stck_lwpr",  "0")).replace(",", "")),
             "open":     int(str(d.get("stck_oprc",  "0")).replace(",", "")),
+            "per":      d.get("per",  ""),   # 🔥 KIS가 직접 제공
+            "pbr":      d.get("pbr",  ""),   # 🔥 KIS가 직접 제공
+            "eps":      d.get("eps",  ""),
+            "bps":      d.get("bps",  ""),
         }
     except:
         return None
@@ -564,10 +568,11 @@ def get_dart_eps_bps(corp_code):
     return None
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=60)
 def get_fundamentals(ticker, is_us_stock, df_krx=None):
     per, pbr = "N/A", "N/A"
 
+    # ── 미국 주식: Yahoo Finance ──
     if is_us_stock:
         try:
             info = yf.Ticker(ticker).info
@@ -577,30 +582,23 @@ def get_fundamentals(ticker, is_us_stock, df_krx=None):
             pass
         return per, pbr
 
-    raw_code = ticker.split(".")[0]
+    # ── 한국 주식: KIS API에서 직접 가져오기 ──
+    raw_code   = ticker.split(".")[0]
+    price_data = get_kis_price(raw_code)
 
-    # 플랜 A: DART EPS/BPS (가장 정확)
-    dart_key = st.secrets.get("DART_API_KEY", "")
-    if dart_key:
+    if price_data:
+        p = str(price_data.get("per", "")).strip()
+        b = str(price_data.get("pbr", "")).strip()
         try:
-            corp_code  = get_dart_corp_code(raw_code)
-            financials = get_dart_eps_bps(corp_code) if corp_code else None
-            if financials:
-                # KIS 실시간 현재가 사용
-                price_data = get_kis_price(raw_code)
-                price = price_data["price"] if price_data and price_data["price"] > 0 else None
-                if not price:
-                    hist  = yf.Ticker(ticker).history(period="1d", auto_adjust=False).dropna(subset=["Close"])
-                    price = float(hist["Close"].iloc[-1]) if not hist.empty else 0
-                if price and price > 0:
-                    eps = financials.get("eps")
-                    bps = financials.get("bps")
-                    if eps and eps > 0: per = f"{price / eps:.2f}배"
-                    if bps and bps > 0: pbr = f"{price / bps:.2f}배"
+            if p and float(p) > 0: per = f"{float(p):.2f}배"
+        except:
+            pass
+        try:
+            if b and float(b) > 0: pbr = f"{float(b):.2f}배"
         except:
             pass
 
-    # 플랜 B: Daum Finance API 폴백
+    # ── KIS 실패 시 Daum 폴백 ──
     if per == "N/A" or pbr == "N/A":
         try:
             res = requests.get(
@@ -620,7 +618,6 @@ def get_fundamentals(ticker, is_us_stock, df_krx=None):
             pass
 
     return per, pbr
-
 # ==========================================
 # 6. 유틸리티 함수
 # ==========================================

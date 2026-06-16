@@ -6,6 +6,5 @@ requests
 pandas
 numpy
 FinanceDataReader
-pykrx
 beautifulsoup4
 lxml

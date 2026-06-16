@@ -33,27 +33,27 @@ US_STOCKS = {"애플": "AAPL", "엔비디아": "NVDA", "테슬라": "TSLA", "마
 @st.cache_data(ttl=3600)
 def get_krx_full_data():
     try:
-        df_kospi  = fdr.StockListing('KOSPI')
-        df_kosdaq = fdr.StockListing('KOSDAQ')
-        df = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
+        # 🔥 핵심 변경: 'KRX' 전체로 불러오면 PER/PBR 공식 데이터 포함됨
+        df = fdr.StockListing('KRX')
 
-        # 🔥 실제 컬럼명 확인 후 정확하게 매핑
-        # FDR 실제 컬럼: Code, Name, Market, Close, Changes, ChagesRatio(오타), Volume, Marcap
+        # 실제 컬럼명 매핑 (앞서 확인한 FDR 컬럼 기준)
         col_map = {
-            'ChagesRatio': 'ChgRate',  # FDR의 오타 컬럼명 정정
+            'ChagesRatio': 'ChgRate',   # FDR 오타 수정
         }
         df.rename(columns=col_map, inplace=True)
 
-        # PER/PBR은 FDR StockListing에 없으므로 빈 컬럼으로 초기화
-        # (개별 종목 분석 시 Daum API + 직접 계산으로 채움)
-        df['PER'] = np.nan
-        df['PBR'] = np.nan
+        # Market 컬럼 안전하게 처리
+        if 'Market' not in df.columns:
+            df['Market'] = 'KOSPI'
+
+        # PER/PBR 컬럼이 없으면 빈 컬럼 추가
+        if 'PER' not in df.columns: df['PER'] = np.nan
+        if 'PBR' not in df.columns: df['PBR'] = np.nan
 
         keep = [c for c in ['Name','Code','Market','Close','ChgRate','Volume','Marcap','PER','PBR'] if c in df.columns]
         df = df[keep].dropna(subset=['Name','Code'])
-        
-        # 숫자형 컬럼 변환
-        for col in ['Close','ChgRate','Volume','Marcap']:
+
+        for col in ['Close','ChgRate','Volume','Marcap','PER','PBR']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
@@ -61,7 +61,6 @@ def get_krx_full_data():
     except Exception as e:
         st.error(f"KRX 데이터 로딩 실패: {e}")
         return pd.DataFrame()
-
 
 
 def get_ticker_from_name(name, df_krx):
@@ -173,44 +172,48 @@ def fetch_google_news(keyword, limit=5):
 # 🔥 PER/PBR: FDR 데이터에서 직접 읽어오기 (야후 의존 폐기)
 def get_fundamentals(ticker, is_us_stock, df_krx):
     per, pbr = "N/A", "N/A"
-    
+
     if is_us_stock:
-        # 미국 주식은 야후 파이낸스 사용
+        # 미국 주식은 야후 파이낸스 사용 (정상 작동)
         try:
             info = yf.Ticker(ticker).info
             if info.get('trailingPE'): per = f"{info['trailingPE']:.2f}배"
             if info.get('priceToBook'): pbr = f"{info['priceToBook']:.2f}배"
         except: pass
+
     else:
-        # 🔥 한국 주식: FDR 데이터에서 직접 PER/PBR 읽기 (가장 정확!)
+        raw_code = ticker.split('.')[0]
+
+        # [플랜 A] 🔥 FDR KRX 공식 데이터에서 직접 읽기 (네이버와 동일한 KRX 공식 수치)
         if not df_krx.empty and 'PER' in df_krx.columns:
-            raw_code = ticker.split('.')[0]
             match = df_krx[df_krx['Code'] == raw_code]
             if not match.empty:
                 p = match.iloc[0].get('PER')
                 b = match.iloc[0].get('PBR')
-                if pd.notna(p) and p != 0: per = f"{float(p):.2f}배"
-                if pd.notna(b) and b != 0: pbr = f"{float(b):.2f}배"
-        
-        # FDR에서 못 가져왔다면 재무제표 직접 계산
+                if pd.notna(p) and float(p) > 0: per = f"{float(p):.2f}배"
+                if pd.notna(b) and float(b) > 0: pbr = f"{float(b):.2f}배"
+
+        # [플랜 B] FDR에 값이 없을 때 → Daum 금융 API (네이버보다 차단이 덜함)
         if per == "N/A" or pbr == "N/A":
             try:
-                tk = yf.Ticker(ticker)
-                price = tk.history(period="1d")['Close'].iloc[-1]
-                shares = tk.info.get('sharesOutstanding') or tk.info.get('impliedSharesOutstanding')
-                if shares:
-                    if per == "N/A":
-                        inc = tk.income_stmt
-                        if not inc.empty and 'Net Income' in inc.index:
-                            net_income = inc.loc['Net Income'].dropna().iloc[0]
-                            if net_income > 0: per = f"{(price * shares) / net_income:.2f}배 (계산)"
-                    if pbr == "N/A":
-                        bal = tk.balance_sheet
-                        if not bal.empty and 'Stockholders Equity' in bal.index:
-                            equity = bal.loc['Stockholders Equity'].dropna().iloc[0]
-                            if equity > 0: pbr = f"{(price * shares) / equity:.2f}배 (계산)"
+                daum_headers = {
+                    'User-Agent': 'Mozilla/5.0',
+                    'Referer': f'https://finance.daum.net/quotes/A{raw_code}',
+                }
+                res = requests.get(
+                    f"https://finance.daum.net/api/quotes/A{raw_code}",
+                    headers=daum_headers, timeout=3
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    if per == "N/A" and data.get('per'):
+                        per = f"{float(data['per']):.2f}배"
+                    if pbr == "N/A" and data.get('pbr'):
+                        pbr = f"{float(data['pbr']):.2f}배"
             except: pass
+
     return per, pbr
+
 
 # 🔥 진짜 퀀트 스크리닝: FDR 전체 데이터 기반 실시간 종목 발굴
 @st.cache_data(ttl=1800)

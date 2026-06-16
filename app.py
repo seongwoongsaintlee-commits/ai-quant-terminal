@@ -47,12 +47,9 @@ def get_kis_base_url():
     is_real = st.secrets.get("KIS_IS_REAL", False)
     return "https://openapi.koreainvestment.com:9443" if is_real else "https://openapivts.koreainvestment.com:29443"
 
+# 기존의 session_state 확인 로직을 다 지우고, Streamlit 캐시로 11시간(39600초) 동안 토큰을 기억하게 만듭니다.
+@st.cache_data(ttl=39600)
 def get_kis_token():
-    now = datetime.now()
-    if (st.session_state.kis_token and
-        st.session_state.kis_token_expire and
-        now < st.session_state.kis_token_expire):
-        return st.session_state.kis_token
     try:
         app_key    = st.secrets.get("KIS_APP_KEY", "")
         app_secret = st.secrets.get("KIS_APP_SECRET", "")
@@ -65,16 +62,11 @@ def get_kis_token():
             headers={"Content-Type": "application/json"},
             timeout=10
         )
-        # 🟢 응답 코드가 200(정상)이 아닐 경우 사이드바에 에러 메시지를 강제 출력
         if res.status_code != 200:
             st.sidebar.error(f"KIS 토큰 발급 거부됨: {res.text}")
             return None
             
-        token = res.json().get("access_token")
-        if token:
-            st.session_state.kis_token        = token
-            st.session_state.kis_token_expire = now + timedelta(hours=11)
-            return token
+        return res.json().get("access_token")
     except Exception as e:
         st.sidebar.error(f"KIS 접속 아예 실패: {e}")
     return None

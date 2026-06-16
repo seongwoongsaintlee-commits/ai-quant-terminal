@@ -8,3 +8,5 @@ numpy
 beautifulsoup4
 lxml
 matplotlib
+OpenDartReader
+ta

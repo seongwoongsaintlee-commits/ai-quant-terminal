@@ -34,10 +34,9 @@ if "current_stock" not in st.session_state:
     st.session_state.current_stock = "없음"
 
 # ==========================================
-# 1. 크롤링 및 유틸리티 함수 (KRX 우회)
+# 1. 크롤링 및 유틸리티 함수 (KRX 우회 + 한글 인코딩 해결)
 # ==========================================
 
-# 🔥 핵심 로직: KRX 차단을 무시하는 네이버 자동완성 API 기반 실시간 종목 매핑
 @st.cache_data(ttl=86400)
 def get_ticker_from_naver(keyword):
     keyword = keyword.strip()
@@ -47,11 +46,16 @@ def get_ticker_from_naver(keyword):
     if re.match(r'^[A-Za-z]+$', keyword): 
         return keyword.upper(), True, keyword.upper()
 
-    # 네이버 금융 자동완성 API를 호출하여 즉시 코드 변환
-    url = f"https://ac.finance.naver.com/ac?q={urllib.parse.quote(keyword)}&q_enc=euc-kr&st=111&r_format=json&r_enc=euc-kr"
     try:
+        # 🔥 한글 깨짐 방지: 네이버 구형 서버에 맞춰 한글을 EUC-KR로 변환 후 전송
+        encoded_keyword = urllib.parse.quote(keyword.encode('euc-kr'))
+        # r_enc=utf-8 로 설정하여 받는 결과는 파이썬이 읽기 쉬운 최신 포맷으로 받음
+        url = f"https://ac.finance.naver.com/ac?q={encoded_keyword}&q_enc=euc-kr&st=111&r_format=json&r_enc=utf-8"
+        
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-        items = res.json().get('items', [[]])[0]
+        data = res.json()
+        items = data.get('items', [[]])[0]
+        
         if items:
             for item in items:
                 name, code, market = item[0], item[1], item[2]

@@ -32,34 +32,42 @@ US_STOCKS = {"애플": "AAPL", "엔비디아": "NVDA", "테슬라": "TSLA", "마
 # 🔥 한국 전 종목 실시간 시세 + PER/PBR 한 번에 가져오기 (FDR은 KRX에서 공식 데이터를 받아옴)
 @st.cache_data(ttl=3600)
 def get_krx_full_data():
-    """FDR로 KOSPI/KOSDAQ 전 종목의 실시간 시세, PER, PBR, 시가총액, 거래량을 한 번에 가져옵니다."""
     try:
-        df_kospi = fdr.StockListing('KOSPI')
+        df_kospi  = fdr.StockListing('KOSPI')
         df_kosdaq = fdr.StockListing('KOSDAQ')
+        
+        df_kospi['_Market']  = 'KOSPI'
+        df_kosdaq['_Market'] = 'KOSDAQ'
         df = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
         
-        # 컬럼명 표준화 (FDR 버전에 따라 다를 수 있음)
+        # 🔥 FDR 버전 상관없이 컬럼명을 출력해서 확인 (디버깅용, 나중에 삭제 가능)
+        st.sidebar.caption(f"FDR 컬럼: {df.columns.tolist()}")
+        
+        # 컬럼명 유연하게 매핑 (대소문자, 공백 무시)
         col_map = {}
         for c in df.columns:
-            cl = c.lower()
-            if 'name' in cl: col_map[c] = 'Name'
-            elif 'code' in cl or 'symbol' in cl: col_map[c] = 'Code'
-            elif 'market' in cl: col_map[c] = 'Market'
-            elif 'per' == cl: col_map[c] = 'PER'
-            elif 'pbr' == cl: col_map[c] = 'PBR'
-            elif 'marcap' in cl or 'cap' in cl: col_map[c] = 'Marcap'
-            elif 'volume' in cl or 'vol' in cl: col_map[c] = 'Volume'
-            elif 'close' in cl or 'price' in cl: col_map[c] = 'Close'
-            elif 'change' in cl or 'chng' in cl: col_map[c] = 'ChgRate'
+            cl = c.lower().replace(' ', '').replace('_', '')
+            if cl == 'name':          col_map[c] = 'Name'
+            elif cl in ('code', 'symbol', 'ticker'): col_map[c] = 'Code'
+            elif cl == 'per':         col_map[c] = 'PER'
+            elif cl == 'pbr':         col_map[c] = 'PBR'
+            elif cl in ('marcap', 'marketcap', 'cap'): col_map[c] = 'Marcap'
+            elif cl in ('volume', 'vol'): col_map[c] = 'Volume'
+            elif cl in ('close', 'price', 'closeprice'): col_map[c] = 'Close'
+            elif cl in ('changerate', 'chgrate', 'changes', 'change', 'flucrate', 'fluctuationrate'): col_map[c] = 'ChgRate'
+        
         df.rename(columns=col_map, inplace=True)
         
-        # 필수 컬럼만 남기기
+        # _Market을 Market으로 사용 (FDR 원본 컬럼 대신 우리가 붙인 것 사용)
+        df['Market'] = df['_Market']
+        
         keep = [c for c in ['Name','Code','Market','Close','ChgRate','Volume','Marcap','PER','PBR'] if c in df.columns]
         df = df[keep].dropna(subset=['Name','Code'])
         return df
     except Exception as e:
-        st.warning(f"KRX 데이터 로딩 실패: {e}")
+        st.error(f"KRX 데이터 로딩 실패: {e}")
         return pd.DataFrame()
+
 
 def get_ticker_from_name(name, df_krx):
     name = name.strip()
@@ -99,30 +107,39 @@ def get_ticker_from_name(name, df_krx):
 
 # 🔥 FDR 데이터로 실시간 랭킹 생성 (네이버 크롤링 완전 폐기)
 def get_ranking_tables(df_krx):
-    """FDR에서 받아온 전체 종목 데이터를 기준별로 정렬하여 랭킹 테이블 반환"""
     if df_krx.empty:
         return {k: pd.DataFrame() for k in ['kospi_cap','kosdaq_cap','kospi_vol','kosdaq_vol','price_up','price_down']}
     
-    kospi = df_krx[df_krx['Market'].str.upper().str.contains('KOSPI', na=False)].copy()
-    kosdaq = df_krx[df_krx['Market'].str.upper().str.contains('KOSDAQ', na=False)].copy()
+    # 🔥 'Market' 컬럼이 확실히 있다고 보장된 상태에서 필터링
+    if 'Market' not in df_krx.columns:
+        kospi  = df_krx.copy()
+        kosdaq = df_krx.copy()
+    else:
+        kospi  = df_krx[df_krx['Market'] == 'KOSPI'].copy()
+        kosdaq = df_krx[df_krx['Market'] == 'KOSDAQ'].copy()
     
     def make_table(df, sort_col, ascending=False, n=30):
-        if sort_col not in df.columns: return pd.DataFrame()
+        if sort_col not in df.columns or df.empty:
+            return pd.DataFrame()
         df = df[df[sort_col].notna()].sort_values(sort_col, ascending=ascending).head(n)
         cols = ['Name','Close','ChgRate','Volume','Marcap','PER','PBR']
         cols = [c for c in cols if c in df.columns]
         result = df[cols].copy()
-        rename = {'Name':'종목명','Close':'현재가','ChgRate':'등락률(%)','Volume':'거래량','Marcap':'시가총액','PER':'PER','PBR':'PBR'}
+        rename = {
+            'Name':'종목명', 'Close':'현재가', 'ChgRate':'등락률(%)',
+            'Volume':'거래량', 'Marcap':'시가총액', 'PER':'PER', 'PBR':'PBR'
+        }
         return result.rename(columns=rename)
     
     return {
-        'kospi_cap':  make_table(kospi,  'Marcap',   ascending=False),
-        'kosdaq_cap': make_table(kosdaq, 'Marcap',   ascending=False),
-        'kospi_vol':  make_table(kospi,  'Volume',   ascending=False),
-        'kosdaq_vol': make_table(kosdaq, 'Volume',   ascending=False),
-        'price_up':   make_table(df_krx, 'ChgRate',  ascending=False),
-        'price_down': make_table(df_krx, 'ChgRate',  ascending=True),
+        'kospi_cap':  make_table(kospi,   'Marcap',  ascending=False),
+        'kosdaq_cap': make_table(kosdaq,  'Marcap',  ascending=False),
+        'kospi_vol':  make_table(kospi,   'Volume',  ascending=False),
+        'kosdaq_vol': make_table(kosdaq,  'Volume',  ascending=False),
+        'price_up':   make_table(df_krx,  'ChgRate', ascending=False),
+        'price_down': make_table(df_krx,  'ChgRate', ascending=True),
     }
+
 
 @st.cache_data(ttl=300)
 def get_major_indices():

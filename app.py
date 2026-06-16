@@ -54,80 +54,112 @@ def get_recent_bizday_str():
     return d.strftime('%Y%m%d')
 
 @st.cache_data(ttl=3600)
-def get_krx_full_data(_krx_client):
+def get_krx_full_data():
     """
-    KRX OpenAPI로 전 종목 시세 + PER/PBR 공식 데이터 가져오기
-    네이버/HTS와 동일한 수치 보장
+    KRX OpenAPI를 라이브러리 없이 직접 HTTP 호출
+    pykrx-openapi 라이브러리 불필요
     """
-    if _krx_client is None:
-        return pd.DataFrame()
-
-    today = get_recent_bizday_str()
-
     try:
-        # KOSPI 시세 (현재가, 거래량, 등락률)
-        df_kospi_price = _krx_client.get_kospi_daily_trade(bas_dd=today)
-        df_kospi_price['Market'] = 'KOSPI'
+        krx_api_key = st.secrets.get("KRX_API_KEY", "")
+        today = datetime.now().strftime('%Y%m%d')
 
-        # KOSDAQ 시세
-        df_kosdaq_price = _krx_client.get_kosdaq_daily_trade(bas_dd=today)
-        df_kosdaq_price['Market'] = 'KOSDAQ'
-
-        df_price = pd.concat([df_kospi_price, df_kosdaq_price], ignore_index=True)
-
-        # 컬럼명 표준화 (KRX OpenAPI 응답 컬럼명)
-        col_map = {
-            'ISU_NM':    'Name',       # 종목명
-            'ISU_CD':    'Code',       # 종목코드
-            'TDD_CLSPRC':'Close',      # 종가
-            'ACC_TRDVOL':'Volume',     # 거래량
-            'FLUC_RT':   'ChgRate',    # 등락률
-            'MKTCAP':    'Marcap',     # 시가총액
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'application/json',
         }
-        df_price.rename(columns=col_map, inplace=True)
 
-        # 숫자 컬럼 변환 (KRX는 콤마 포함 문자열로 올 수 있음)
-        for col in ['Close', 'Volume', 'ChgRate', 'Marcap']:
-            if col in df_price.columns:
-                df_price[col] = df_price[col].astype(str).str.replace(',','').str.replace('%','')
-                df_price[col] = pd.to_numeric(df_price[col], errors='coerce')
+        all_dfs = []
 
-        # PER/PBR: KRX OpenAPI 기본정보 API
-        try:
-            df_fund_kospi  = _krx_client.get_kospi_per_pbr(bas_dd=today)
-            df_fund_kosdaq = _krx_client.get_kosdaq_per_pbr(bas_dd=today)
-            df_fund = pd.concat([df_fund_kospi, df_fund_kosdaq], ignore_index=True)
-
-            fund_col_map = {
-                'ISU_CD': 'Code',
-                'PER':    'PER',
-                'PBR':    'PBR',
+        for market_nm in ["KOSPI", "KOSDAQ"]:
+            # KRX OpenAPI: 주식 시세 (종가, 거래량, 등락률, 시가총액)
+            url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+            params = {
+                "bld":        "dbms/MDC/STAT/standard/MDCSTAT01501",
+                "mktId":      "STK" if market_nm == "KOSPI" else "KSQ",
+                "trdDd":      today,
+                "share":      "1",
+                "money":      "1",
+                "csvxls_isNo":"false",
             }
-            df_fund.rename(columns=fund_col_map, inplace=True)
 
-            for col in ['PER', 'PBR']:
-                if col in df_fund.columns:
-                    df_fund[col] = df_fund[col].astype(str).str.replace(',','')
-                    df_fund[col] = pd.to_numeric(df_fund[col], errors='coerce')
+            try:
+                res = requests.post(url, data=params, headers=headers, timeout=10)
+                data = res.json()
+                rows = data.get("OutBlock_1", [])
 
-            # 시세 데이터에 PER/PBR 병합
-            if 'Code' in df_fund.columns:
-                df_price = df_price.merge(
-                    df_fund[['Code','PER','PBR']],
-                    on='Code', how='left'
-                )
-        except Exception as e:
-            st.warning(f"PER/PBR 로딩 실패 (Daum으로 개별 조회): {e}")
-            df_price['PER'] = np.nan
-            df_price['PBR'] = np.nan
+                if rows:
+                    df = pd.DataFrame(rows)
+                    # KRX 응답 컬럼명 매핑
+                    col_map = {
+                        'ISU_ABBRV':  'Name',     # 종목명
+                        'ISU_CD':     'Code',     # 종목코드
+                        'TDD_CLSPRC': 'Close',    # 종가
+                        'ACC_TRDVOL': 'Volume',   # 거래량
+                        'FLUC_RT':    'ChgRate',  # 등락률
+                        'MKTCAP':     'Marcap',   # 시가총액
+                    }
+                    df.rename(columns=col_map, inplace=True)
+                    df['Market'] = market_nm
 
-        keep = [c for c in ['Name','Code','Market','Close','ChgRate','Volume','Marcap','PER','PBR'] if c in df_price.columns]
-        return df_price[keep].dropna(subset=['Name','Code']).reset_index(drop=True)
+                    # 숫자 변환 (KRX는 콤마 포함 문자열)
+                    for col in ['Close', 'Volume', 'ChgRate', 'Marcap']:
+                        if col in df.columns:
+                            df[col] = df[col].astype(str).str.replace(',','').str.replace('%','')
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+                    all_dfs.append(df)
+            except Exception as e:
+                st.warning(f"{market_nm} 시세 로딩 실패: {e}")
+                continue
+
+        if not all_dfs:
+            raise ValueError("KRX 시세 데이터 없음")
+
+        df_all = pd.concat(all_dfs, ignore_index=True)
+
+        # PER/PBR: KRX OpenAPI 직접 호출
+        per_dfs = []
+        for market_nm in ["KOSPI", "KOSDAQ"]:
+            try:
+                params_fund = {
+                    "bld":        "dbms/MDC/STAT/standard/MDCSTAT03501",
+                    "mktId":      "STK" if market_nm == "KOSPI" else "KSQ",
+                    "trdDd":      today,
+                    "csvxls_isNo":"false",
+                }
+                res_fund = requests.post(url, data=params_fund, headers=headers, timeout=10)
+                data_fund = res_fund.json()
+                rows_fund = data_fund.get("OutBlock_1", [])
+                if rows_fund:
+                    df_fund = pd.DataFrame(rows_fund)
+                    fund_col_map = {
+                        'ISU_CD': 'Code',
+                        'PER':    'PER',
+                        'PBR':    'PBR',
+                    }
+                    df_fund.rename(columns=fund_col_map, inplace=True)
+                    for col in ['PER', 'PBR']:
+                        if col in df_fund.columns:
+                            df_fund[col] = df_fund[col].astype(str).str.replace(',','')
+                            df_fund[col] = pd.to_numeric(df_fund[col], errors='coerce')
+                    per_dfs.append(df_fund[['Code','PER','PBR']])
+            except:
+                continue
+
+        if per_dfs:
+            df_per = pd.concat(per_dfs, ignore_index=True)
+            df_all = df_all.merge(df_per, on='Code', how='left')
+        else:
+            df_all['PER'] = np.nan
+            df_all['PBR'] = np.nan
+
+        keep = [c for c in ['Name','Code','Market','Close','ChgRate','Volume','Marcap','PER','PBR'] if c in df_all.columns]
+        return df_all[keep].dropna(subset=['Name','Code']).reset_index(drop=True)
 
     except Exception as e:
-        st.error(f"KRX OpenAPI 데이터 로딩 실패: {e}")
-        # 폴백: FDR 사용
+        st.warning(f"KRX 직접 호출 실패 ({e}), FDR로 전환합니다.")
         return get_krx_data_fdr_fallback()
+
 
 @st.cache_data(ttl=3600)
 def get_krx_data_fdr_fallback():

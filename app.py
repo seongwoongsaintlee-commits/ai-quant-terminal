@@ -35,38 +35,33 @@ def get_krx_full_data():
     try:
         df_kospi  = fdr.StockListing('KOSPI')
         df_kosdaq = fdr.StockListing('KOSDAQ')
-        
-        df_kospi['_Market']  = 'KOSPI'
-        df_kosdaq['_Market'] = 'KOSDAQ'
         df = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
-        
-        # 🔥 FDR 버전 상관없이 컬럼명을 출력해서 확인 (디버깅용, 나중에 삭제 가능)
-        st.sidebar.caption(f"FDR 컬럼: {df.columns.tolist()}")
-        
-        # 컬럼명 유연하게 매핑 (대소문자, 공백 무시)
-        col_map = {}
-        for c in df.columns:
-            cl = c.lower().replace(' ', '').replace('_', '')
-            if cl == 'name':          col_map[c] = 'Name'
-            elif cl in ('code', 'symbol', 'ticker'): col_map[c] = 'Code'
-            elif cl == 'per':         col_map[c] = 'PER'
-            elif cl == 'pbr':         col_map[c] = 'PBR'
-            elif cl in ('marcap', 'marketcap', 'cap'): col_map[c] = 'Marcap'
-            elif cl in ('volume', 'vol'): col_map[c] = 'Volume'
-            elif cl in ('close', 'price', 'closeprice'): col_map[c] = 'Close'
-            elif cl in ('changerate', 'chgrate', 'changes', 'change', 'flucrate', 'fluctuationrate'): col_map[c] = 'ChgRate'
-        
+
+        # 🔥 실제 컬럼명 확인 후 정확하게 매핑
+        # FDR 실제 컬럼: Code, Name, Market, Close, Changes, ChagesRatio(오타), Volume, Marcap
+        col_map = {
+            'ChagesRatio': 'ChgRate',  # FDR의 오타 컬럼명 정정
+        }
         df.rename(columns=col_map, inplace=True)
-        
-        # _Market을 Market으로 사용 (FDR 원본 컬럼 대신 우리가 붙인 것 사용)
-        df['Market'] = df['_Market']
-        
+
+        # PER/PBR은 FDR StockListing에 없으므로 빈 컬럼으로 초기화
+        # (개별 종목 분석 시 Daum API + 직접 계산으로 채움)
+        df['PER'] = np.nan
+        df['PBR'] = np.nan
+
         keep = [c for c in ['Name','Code','Market','Close','ChgRate','Volume','Marcap','PER','PBR'] if c in df.columns]
         df = df[keep].dropna(subset=['Name','Code'])
+        
+        # 숫자형 컬럼 변환
+        for col in ['Close','ChgRate','Volume','Marcap']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
         return df
     except Exception as e:
         st.error(f"KRX 데이터 로딩 실패: {e}")
         return pd.DataFrame()
+
 
 
 def get_ticker_from_name(name, df_krx):

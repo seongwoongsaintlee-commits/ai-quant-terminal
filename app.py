@@ -936,4 +936,98 @@ with tab_search:
                             f"**[타깃]** {display_name} (현재가:{price_fmt}, PER:{per}, PBR:{pbr})\n**[Peer]** {json.dumps(peer_data,ensure_ascii=False)}\n**[매크로]** 환율:{macro.get('USD_KRW')}, 미10년물:{macro.get('US_10Y')}%, VIX:{macro.get('VIX')}\n**[뉴스]** {news_text}\n\n1.비즈니스모델 2.밸류에이션 3.투자의견 및 목표가를 마크다운으로 작성하라.",
                             api_key, model_choice,
                             "당신은 월스트리트 수석 애널리스트입니다. 마크다운으로 작성하세요.",
-                            is_json
+                            is_json=False
+                        )
+                        if report_text:
+                            st.success(f"✅ {display_name} 리포트 완료")
+                            col1, col2 = st.columns([1,2])
+                            with col1:
+                                st.metric("PER", per)
+                                st.metric("PBR", pbr)
+                                if peer_data: st.dataframe(pd.DataFrame(peer_data), hide_index=True)
+                                st.line_chart(hist["Close"])
+                            with col2:
+                                st.subheader("🧠 딥다이브 퀀트 리포트")
+                                st.markdown(report_text)
+                except Exception as e:
+                    st.error(f"분석 오류: {e}")
+
+with tab_recommend:
+    st.header("🏆 듀얼 엔진 주식 스크리너")
+    col_a, col_b = st.columns(2)
+    with col_a: market_choice   = st.radio("시장:", ["🇰🇷 국내 증시","🇺🇸 미국 증시"], horizontal=True)
+    with col_b: strategy_choice = st.radio("전략:", ["🔥 시장 주도주","💎 숨은 보석 발굴"], horizontal=True)
+    if st.button("🚀 실시간 추천받기", use_container_width=True):
+        with st.spinner("실시간 퀀트 스크리닝 중..."):
+            is_us_r = "미국" in market_choice
+            is_gem  = "숨은 보석" in strategy_choice
+            if is_us_r:
+                data     = get_us_hidden_gems_with_news() if is_gem else get_us_trending_stocks_with_news()
+                currency = "$"
+            else:
+                data     = get_hidden_gem_stocks(df_krx) if is_gem else get_trending_stocks_with_news(df_krx)
+                currency = "₩"
+            if not data:
+                st.error("❌ 데이터 수집 실패.")
+            else:
+                recs, _ = get_ai_response(
+                    f"후보 종목 실시간 데이터: {json.dumps(data,ensure_ascii=False)}\n\n{'저평가 가치주 상위 5개' if is_gem else '모멘텀 강한 주도주 상위 5개'} 추천.",
+                    api_key, model_choice,
+                    "당신은 퀀트 매니저입니다. [{'stock':'종목명','current_price':'숫자만','sentiment':'호재요약','reason':'추천사유'}] JSON 배열로만 응답.",
+                    is_json=True
+                )
+                if recs:
+                    st.success("🎉 퀀트 스크리닝 완료!")
+                    cols = st.columns(len(recs))
+                    for idx, rec in enumerate(recs):
+                        with cols[idx]:
+                            st.info(f"### 🥇 TOP {idx+1}\n**{rec.get('stock')}**")
+                            raw_p = str(rec.get("current_price","0")).replace(",","").replace("원","").replace("$","").replace(" ","")
+                            try:    fmt_p = f"${float(raw_p):,.2f}" if is_us_r else f"₩{int(float(raw_p)):,}"
+                            except: fmt_p = f"{currency}{raw_p}"
+                            st.metric("현재가", fmt_p)
+                            st.markdown(f"**📰 요약:** {rec.get('sentiment')}")
+                            st.write(f"**💡 사유:** {rec.get('reason')}")
+
+with tab_backtest:
+    st.header("⏳ 퀀트 알고리즘 백테스팅")
+    col1, col2 = st.columns([1,3])
+    with col1:
+        test_input = st.text_input("종목명", value="삼성전자")
+        test_years = st.slider("기간(년)", 1, 5, 3)
+        run_bt     = st.button("백테스트 시작")
+    with col2:
+        if run_bt and test_input:
+            t_ticker, t_is_us, t_name = get_ticker_from_name(test_input, df_krx)
+            if t_ticker:
+                st.session_state.current_stock = t_name
+                with st.spinner("시뮬레이션 중..."):
+                    bt_df = run_backtest(t_ticker, t_is_us, test_years)
+                    if bt_df is not None and not bt_df.empty:
+                        mr = (bt_df["Cumulative_Market"].iloc[-1]-1)*100
+                        sr = (bt_df["Cumulative_Strategy"].iloc[-1]-1)*100
+                        st.subheader(f"📊 {t_name} {test_years}년 시뮬레이션")
+                        c1, c2 = st.columns(2)
+                        c1.metric("Buy & Hold",   f"{mr:.2f}%")
+                        c2.metric("전략 수익률",   f"{sr:.2f}%", delta=f"{sr-mr:.2f}% 초과수익")
+                        st.line_chart(bt_df[["Cumulative_Market","Cumulative_Strategy"]])
+            else:
+                st.error("정확한 종목명을 입력하세요.")
+
+with tab_chat:
+    st.header("💬 전담 AI 애널리스트 채팅")
+    current_focus = st.session_state.get("current_stock","없음")
+    if current_focus != "없음": st.info(f"💡 현재 분석 종목: **'{current_focus}'**")
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]): st.markdown(msg["content"])
+    if prompt := st.chat_input("질문을 입력하세요..."):
+        with st.chat_message("user"): st.markdown(prompt)
+        st.session_state.chat_history.append({"role":"user","content":prompt})
+        history = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.chat_history[-5:]])
+        resp, _ = get_ai_response(
+            f"분석 중 종목: {current_focus}\n[대화]\n{history}\n[질문] {prompt}\n전문 애널리스트 톤으로 답변해.",
+            api_key, model_choice, "당신은 퀀트 애널리스트입니다.", is_json=False
+        )
+        if resp:
+            with st.chat_message("assistant"): st.markdown(resp)
+            st.session_state.chat_history.append({"role":"assistant","content":resp})

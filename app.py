@@ -15,7 +15,7 @@ import pandas as pd
 import numpy as np
 
 # ==========================================
-# 공통 요청 헤더 (모바일 위장)
+# 공통 요청 헤더
 # ==========================================
 MOBILE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
@@ -30,53 +30,53 @@ if "current_stock" not in st.session_state:
     st.session_state.current_stock = "없음"
 
 # ==========================================
-# 1. 크롤링 및 실시간 데이터 수집 함수 (Yahoo Finance 중심)
+# 1. 크롤링 및 실시간 데이터 수집 (진짜 퀀트 엔진)
 # ==========================================
 
-# 한국 전 종목 코드를 안전하게 가져옵니다.
-@st.cache_data(ttl=86400)
-def get_korean_market_symbols():
+# 🔥 전체 시장 데이터 풀(Pool) 로드 (내장 리스트 폐기, 실제 2000개 종목 데이터 확보)
+@st.cache_data(ttl=3600)
+def get_full_market_data():
     try:
         import FinanceDataReader as fdr
         df = fdr.StockListing('KRX')
-        # 우선주나 펀드 등 제외하고 보통주만 필터링 (간략화)
         df = df[df['Market'].isin(['KOSPI', 'KOSDAQ'])]
-        
         code_dict = dict(zip(df['Name'], df['Code']))
         market_dict = dict(zip(df['Name'], df['Market']))
-        return code_dict, market_dict
-    except Exception as e:
-        print(f"KRX 심볼 가져오기 실패: {e}")
-        return {}, {}
+        return df, code_dict, market_dict
+    except:
+        return pd.DataFrame(), {}, {}
 
-# 이름을 티커(.KS / .KQ)로 정확히 매핑
 def get_ticker_from_name(name, code_dict, market_dict):
     name = name.strip()
     if name in US_STOCKS: return US_STOCKS[name], True, name
     if re.match(r'^[A-Za-z]+$', name): return name.upper(), True, name.upper()
 
     clean_input = name.replace(" ", "").upper()
-    
-    # 1. 완전 일치 검색
     for k, v in code_dict.items():
         if clean_input == k.replace(" ", "").upper():
-            ticker = f"{v}.KQ" if "KOSDAQ" in market_dict[k] else f"{v}.KS"
-            return ticker, False, k
-            
-    # 2. 부분 일치 검색
+            return f"{v}.KQ" if "KOSDAQ" in market_dict[k] else f"{v}.KS", False, k
     for k, v in code_dict.items():
         if clean_input in k.replace(" ", "").upper():
-            ticker = f"{v}.KQ" if "KOSDAQ" in market_dict[k] else f"{v}.KS"
-            return ticker, False, k
+            return f"{v}.KQ" if "KOSDAQ" in market_dict[k] else f"{v}.KS", False, k
+            
+    # 네이버 자동완성 우회
+    try:
+        encoded_keyword = urllib.parse.quote(name.encode('euc-kr'))
+        url = f"https://ac.finance.naver.com/ac?q={encoded_keyword}&q_enc=euc-kr&st=111&r_format=json&r_enc=utf-8"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        items = res.json().get('items', [[]])[0]
+        if items:
+            code, market = items[0][1], items[0][2]
+            return f"{code}.KQ" if "KOSDAQ" in market or "코스닥" in market else f"{code}.KS", False, items[0][0]
+    except: pass
             
     return None, False, name
 
-# 네이버 모바일 API로 기본 랭킹 테이블 구성
 @st.cache_data(ttl=60)
 def get_mobile_market_list(api_type, market):
     url = f"https://m.stock.naver.com/api/stocks/{api_type}/{market}?page=1&pageSize=15"
     try:
-        res = requests.get(url, headers=MOBILE_HEADERS, timeout=5)
+        res = requests.get(url, headers=MOBILE_HEADERS, timeout=3)
         stocks = res.json().get('stocks', [])
         result = [{"종목명": s.get('stockName', ''), "현재가": str(s.get('closePrice', '0')), "등락률": ("+" if not str(s.get('fluctuationsRatio', '0')).startswith('-') else "") + str(s.get('fluctuationsRatio', '0')) + "%"} for s in stocks]
         return pd.DataFrame(result)
@@ -107,17 +107,6 @@ def get_major_indices():
         except: res[name] = {"price": 0.0, "diff": 0.0, "pct": 0.0}
     return res
 
-@st.cache_data(ttl=3600)
-def get_macro_data():
-    macros = {"USD_KRW": "KRW=X", "US_10Y": "^TNX", "VIX": "^VIX"}
-    data = {}
-    for key, ticker in macros.items():
-        try:
-            hist = yf.Ticker(ticker).history(period="5d")
-            data[key] = round(hist['Close'].iloc[-1], 2) if not hist.empty else "N/A"
-        except: data[key] = "N/A"
-    return data
-
 def fetch_google_news(keyword, limit=5):
     try:
         encoded_keyword = urllib.parse.quote(keyword)
@@ -126,26 +115,23 @@ def fetch_google_news(keyword, limit=5):
         return [entry.title for entry in feed.entries[:limit]]
     except: return []
 
-# 🔥 100% 실시간 야후 파이낸스 기반 주도주 탐색기
+# 🔥 1. 주도주 100% 리얼 데이터 스크리닝
 @st.cache_data(ttl=1800)
-def get_trending_stocks_with_news(code_dict, market_dict):
+def get_trending_stocks_with_news(krx_df, code_dict, market_dict):
     candidates = []
-    
-    # 1. 네이버 랭킹(거래량)에서 1차 후보군 추출
     m_data = load_market_data()
     pool = pd.concat([m_data.get('kospi_vol', pd.DataFrame()), m_data.get('kosdaq_vol', pd.DataFrame())])
     
     if pool.empty:
-        # 네이버가 막혔다면, FDR 전체 리스트에서 무작위 샘플링하여 실시간 데이터 조회 (랜덤 스크리닝)
-        if code_dict:
-            names = list(code_dict.keys())
-            np.random.shuffle(names)
-            pool = pd.DataFrame({"종목명": names[:30]})
-        else: return []
-
-    pool = pool.drop_duplicates(subset=['종목명']).head(15)
-    
-    # 2. 추출된 후보군을 야후 파이낸스 실시간 데이터로 교차 검증 (진짜 거래량/주가 확인)
+        # 네이버 API가 막혔다면? 전체 2000개 주식 데이터에서 '당일 실제 거래량' 기준 내림차순 정렬하여 상위 30개 추출 (리얼 퀀트)
+        if not krx_df.empty and 'Volume' in krx_df.columns:
+            top_vol_names = krx_df.sort_values('Volume', ascending=False).head(30)['Name'].tolist()
+            pool = pd.DataFrame({"종목명": top_vol_names})
+        else:
+            return []
+    else:
+        pool = pool.drop_duplicates(subset=['종목명']).head(20)
+        
     for _, row in pool.iterrows():
         name = row['종목명']
         ticker, _, _ = get_ticker_from_name(name, code_dict, market_dict)
@@ -153,26 +139,25 @@ def get_trending_stocks_with_news(code_dict, market_dict):
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             if not hist.empty:
-                curr_price = int(hist['Close'].iloc[-1])
-                candidates.append({"종목명": name, "현재가": curr_price, "최신뉴스": fetch_google_news(name, limit=3)})
+                candidates.append({"종목명": name, "현재가": int(hist['Close'].iloc[-1]), "최신뉴스": fetch_google_news(name, limit=3)})
         except: pass
     return candidates
 
-# 🔥 100% 실시간 야후 파이낸스 기반 가치주 탐색기
+# 🔥 2. 숨은 보석(가치주) 100% 리얼 데이터 스크리닝
 @st.cache_data(ttl=1800)
-def get_hidden_gem_stocks(code_dict, market_dict):
+def get_hidden_gem_stocks(krx_df, code_dict, market_dict):
     candidates = []
-    
     m_data = load_market_data()
     kospi_cap = m_data.get('kospi_cap', pd.DataFrame())
     
     if kospi_cap.empty:
-        # 네이버가 막혔을 때, 코스피 대형주 위주로 랜덤 스크리닝
-        if code_dict:
-            kospi_only = [k for k, v in market_dict.items() if 'KOSPI' in v]
-            np.random.shuffle(kospi_only)
-            pool = pd.DataFrame({"종목명": kospi_only[:30]})
-        else: return []
+        # 네이버 API가 막혔다면? 전체 주식 중 '시가총액(Marcap)' 상위 200대 기업 중 무작위 스크리닝하여 분석
+        if not krx_df.empty and 'Marcap' in krx_df.columns:
+            mid_cap_names = krx_df.sort_values('Marcap', ascending=False).head(200)['Name'].tolist()
+            np.random.shuffle(mid_cap_names)
+            pool = pd.DataFrame({"종목명": mid_cap_names[:30]})
+        else:
+            return []
     else: 
         pool = pd.concat([kospi_cap, m_data.get('kosdaq_cap', pd.DataFrame())]).drop_duplicates(subset=['종목명']).head(40)
     
@@ -185,8 +170,7 @@ def get_hidden_gem_stocks(code_dict, market_dict):
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             if not hist.empty:
-                curr_price = int(hist['Close'].iloc[-1])
-                candidates.append({"종목명": name, "현재가": curr_price, "최신뉴스": fetch_google_news(name, limit=3)})
+                candidates.append({"종목명": name, "현재가": int(hist['Close'].iloc[-1]), "최신뉴스": fetch_google_news(name, limit=3)})
         except: pass
     return candidates
 
@@ -222,28 +206,50 @@ def get_peer_group(company_name):
     else: peers = []
     return [p for p in peers if p != company_name][:3]
 
+# 🔥 PER/PBR 직접 계산 포함 3중 안전 로직
 def get_fundamentals(ticker, is_us_stock):
     per, pbr = "N/A", "N/A"
+    
+    # 1. 야후 파이낸스
     try:
         info = yf.Ticker(ticker).info
-        if 'trailingPE' in info: per = f"{info['trailingPE']:.2f}배"
-        if 'priceToBook' in info: pbr = f"{info['priceToBook']:.2f}배"
+        if info.get('trailingPE'): per = f"{info['trailingPE']:.2f}배"
+        if info.get('priceToBook'): pbr = f"{info['priceToBook']:.2f}배"
     except: pass
 
-    # 야후에서 빵꾸난 데이터는 네이버에서 땜빵
+    # 2. Daum 금융 우회
     if (per == "N/A" or pbr == "N/A") and not is_us_stock:
         try:
             raw_code = ticker.split('.')[0]
-            url = f"https://finance.naver.com/item/main.naver?code={raw_code}"
-            res = requests.get(url, headers=MOBILE_HEADERS, timeout=3)
-            # 네이버 서버가 lxml을 튕겨낼 때를 대비해 파이썬 내장 파서(html.parser) 사용
-            soup = BeautifulSoup(res.text, 'html.parser')
-            per_tag = soup.select_one('#_per')
-            pbr_tag = soup.select_one('#_pbr')
-            if per_tag and per_tag.text: per = per_tag.text.strip() + "배"
-            if pbr_tag and pbr_tag.text: pbr = pbr_tag.text.strip() + "배"
+            daum_headers = {'User-Agent': 'Mozilla/5.0', 'Referer': f'https://finance.daum.net/quotes/A{raw_code}'}
+            res = requests.get(f"https://finance.daum.net/api/quotes/A{raw_code}", headers=daum_headers, timeout=3)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get('per'): per = f"{data['per']}배"
+                if data.get('pbr'): pbr = f"{data['pbr']}배"
         except: pass
         
+    # 3. 재무제표 기반 직접 수학적 계산 (진짜 퀀트!)
+    if per == "N/A" or pbr == "N/A":
+        try:
+            tk = yf.Ticker(ticker)
+            price = tk.history(period="1d")['Close'].iloc[-1]
+            shares = tk.info.get('sharesOutstanding') or tk.info.get('impliedSharesOutstanding')
+            
+            if shares:
+                if per == "N/A":
+                    inc = tk.income_stmt
+                    if not inc.empty and 'Net Income' in inc.index:
+                        net_income = inc.loc['Net Income'].dropna().iloc[0]
+                        if net_income > 0: per = f"{(price * shares) / net_income:.2f}배 (계산)"
+                
+                if pbr == "N/A":
+                    bal = tk.balance_sheet
+                    if not bal.empty and 'Stockholders Equity' in bal.index:
+                        total_equity = bal.loc['Stockholders Equity'].dropna().iloc[0]
+                        if total_equity > 0: pbr = f"{(price * shares) / total_equity:.2f}배 (계산)"
+        except: pass
+
     return per, pbr
 
 @st.cache_data(ttl=3600)
@@ -301,7 +307,7 @@ def get_ai_response(prompt_text, api_key, model_choice, instruction_text, is_jso
 def run_quick_analysis(company_name, api_key, model_choice, code_dict, market_dict):
     ticker, is_us_stock, display_name = get_ticker_from_name(company_name, code_dict, market_dict)
     if not ticker:
-        st.error(f"'{company_name}' 종목을 찾지 못했습니다. (종목코드 맵핑 실패)")
+        st.error(f"'{company_name}' 종목을 찾지 못했습니다.")
         return
 
     st.session_state.current_stock = display_name
@@ -358,29 +364,18 @@ def run_quick_analysis(company_name, api_key, model_choice, code_dict, market_di
 # 2. 메인 UI 및 설정
 # ==========================================
 
-# 시작할 때 단 1번만 한국 거래소 상장 리스트를 싹 가져옵니다.
-code_dict, market_dict = get_korean_market_symbols()
+krx_df, code_dict, market_dict = get_full_market_data()
 
 with st.sidebar:
     st.header("⚙️ 터미널 설정")
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
-        st.success("✅ 클라우드 보안 키 자동 연동 완료")
+        st.success("✅ 클라우드 보안 키 연동 완료")
     except:
         st.error("⚠️ Secrets 설정이 필요합니다.")
         api_key = "" 
         
     model_choice = st.selectbox("사용할 AI 모델", ("gemini-3.5-flash", "gemini-3.5-pro"))
-    
-    st.divider()
-    st.header("🔗 자동화 워크플로우")
-    webhook_url = st.text_input("Webhook URL", placeholder="https://script.google.com/macros/s/...")
-    if st.button("테스트 알림 발송"):
-        if webhook_url:
-            try:
-                requests.post(webhook_url, json={"text": "📈 AI 퀀트 터미널: 실시간 자동화 테스트 완료."}, timeout=3)
-                st.success("웹훅 전송 완료!")
-            except: st.error("전송 실패")
 
 st.title("🤖 AI 글로벌 퀀트 터미널")
 
@@ -402,7 +397,7 @@ tab_main, tab_search, tab_recommend, tab_backtest, tab_chat = st.tabs([
 with tab_main:
     m_data = load_market_data()
     if all(df.empty for df in m_data.values()):
-        st.warning("⚠️ 현재 네이버 금융 서버 접속이 불안정하여 실시간 랭킹이 일시적으로 제한됩니다. (딥다이브 분석과 종목 추천은 정상 작동합니다)")
+        st.warning("⚠️ 외부 서버 차단으로 인해 랭킹 일부 기능이 제한되지만, 퀀트 종목 분석과 스크리닝은 자체 엔진으로 정상 작동합니다.")
     else:
         t1, t2, t3, t4, t5, t6 = st.tabs(["👑 KOSPI 시총상위", "👑 KOSDAQ 시총상위", "🌊 KOSPI 거래량", "🌊 KOSDAQ 거래량", "🚀 상승률 상위", "📉 하락률 상위"])
         events = {}
@@ -483,7 +478,7 @@ with tab_recommend:
     with col_b: strategy_choice = st.radio("투자 전략:", ["🔥 시장 주도주", "💎 숨은 보석 발굴"], horizontal=True)
 
     if st.button("🚀 실시간 추천받기", use_container_width=True):
-        with st.spinner("시장 데이터 100% 실시간 스크리닝 및 AI 필터 가동 중..."):
+        with st.spinner("전체 상장사 실시간 데이터 기반 퀀트 스크리닝 중..."):
             is_us_recom = "미국" in market_choice
             is_hidden_gem = "숨은 보석" in strategy_choice
             
@@ -491,10 +486,10 @@ with tab_recommend:
                 trending_data = get_us_hidden_gems_with_news() if is_hidden_gem else get_us_trending_stocks_with_news()
                 currency = "$"
             else:
-                trending_data = get_hidden_gem_stocks(code_dict, market_dict) if is_hidden_gem else get_trending_stocks_with_news(code_dict, market_dict)
+                trending_data = get_hidden_gem_stocks(krx_df, code_dict, market_dict) if is_hidden_gem else get_trending_stocks_with_news(krx_df, code_dict, market_dict)
                 currency = "₩"
 
-            if not trending_data: st.error("❌ 현재 시장 데이터를 실시간으로 수집하는 데 지연이 발생했습니다. 새로고침 후 다시 시도해 주세요.")
+            if not trending_data: st.error("❌ 시장 데이터를 가져오는 데 실패했습니다.")
             else:
                 instruction = "당신은 탁월한 퀀트 매니저입니다. [{'stock':'종목명','current_price':'숫자만','sentiment':'진짜 호재 요약','reason':'추천 사유'}] 형식의 JSON 배열로 응답하세요."
                 strategy_prompt = "저평가 턴어라운드 가치주(Hidden Gem) 상위 5개를 추천해" if is_hidden_gem else "모멘텀이 강력한 유망 주도주 상위 5개를 추천해"
